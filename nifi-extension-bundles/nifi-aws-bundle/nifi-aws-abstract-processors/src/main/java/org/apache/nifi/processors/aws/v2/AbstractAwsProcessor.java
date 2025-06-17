@@ -71,7 +71,7 @@ import java.util.concurrent.TimeUnit;
  *
  * @see <a href="https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/auth/credentials/AwsCredentialsProvider.html">AwsCredentialsProvider</a>
  */
-public abstract class AbstractAwsProcessor<T extends SdkClient> extends AbstractSessionFactoryProcessor implements VerifiableProcessor {
+public abstract class AbstractAwsProcessor<T extends AutoCloseable> extends AbstractSessionFactoryProcessor implements VerifiableProcessor {
     private static final String CREDENTIALS_SERVICE_CLASSNAME = "org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService";
 
     // Obsolete property names
@@ -224,7 +224,14 @@ public abstract class AbstractAwsProcessor<T extends SdkClient> extends Abstract
 
     @OnStopped
     public void onStopped() {
-        clientCache.asMap().values().forEach(SdkClient::close);
+        for (final AutoCloseable closeable : clientCache.asMap().values()) {
+            try {
+                closeable.close();
+            } catch (final Exception e) {
+                getLogger().warn("Failed to close AWS client", e);
+            }
+        }
+
         clientCache.invalidateAll();
         clientCache.cleanUp();
     }
