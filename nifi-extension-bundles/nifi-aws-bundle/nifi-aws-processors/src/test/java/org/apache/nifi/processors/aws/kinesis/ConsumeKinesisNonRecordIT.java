@@ -4,12 +4,18 @@
 
 package org.apache.nifi.processors.aws.kinesis;
 
+import org.apache.nifi.processor.Processor;
 import org.apache.nifi.processors.aws.credentials.provider.AwsCredentialsProviderService;
 import org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerService;
 import org.apache.nifi.reporting.InitializationException;
+import org.apache.nifi.state.MockStateManager;
+import org.apache.nifi.util.MockFlowFile;
+import org.apache.nifi.util.MockProcessSession;
+import org.apache.nifi.util.SharedSessionState;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -29,6 +35,10 @@ import software.amazon.awssdk.services.kinesis.model.PutRecordRequest;
 import software.amazon.awssdk.services.kinesis.model.StreamStatus;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Consume data from Kinesis without using the Record Reader and Record Writer.
@@ -123,7 +133,7 @@ public class ConsumeKinesisNonRecordIT {
                 .shardIteratorType("TRIM_HORIZON")).shardIterator())
             .build());
 
-        while (getRecordsResponse.hasRecords()) {
+        while (getRecordsResponse.hasRecords() && !getRecordsResponse.records().isEmpty()) {
             getRecordsResponse = kinesisClient.getRecords(GetRecordsRequest.builder()
                 .shardIterator(getRecordsResponse.nextShardIterator())
                 .build());
@@ -161,6 +171,42 @@ public class ConsumeKinesisNonRecordIT {
         runner.getFlowFilesForRelationship(ConsumeKinesis.REL_SUCCESS).getFirst().assertContentEquals(greetingWorld);
     }
 
+    @Test
+    void testRollback() throws InterruptedException {
+        final ConsumeKinesis processor = (ConsumeKinesis) runner.getProcessor();
+
+        // First message - during rollback shouldn't be sent anywhere.
+        boolean waitingForMessage = true;
+        while (waitingForMessage) {
+            Thread.sleep(10L);
+            final MockProcessSession session = createFailingSession(processor);
+            try {
+                processor.onTrigger(runner.getProcessContext(), session);
+            } catch (final MockProcessSession.TestSessionRollbackException e) {
+                // Waiting for a rollback to happen.
+                waitingForMessage = false;
+                session.assertAllFlowFilesTransferred(ConsumeKinesis.REL_SUCCESS, 0);
+            }
+        }
+
+        // Second message - shouldn't be send before the first one.
+        final String newMessage = """
+            {"greeting":"world2"}
+            """;
+
+        runner.clearTransferState();
+        pushDataToKinesis("p1", newMessage);
+
+        while (runner.getFlowFilesForRelationship(ConsumeKinesis.REL_SUCCESS).isEmpty()) {
+            Thread.sleep(10L);
+            runner.run(1, false, false);
+        }
+        runner.assertAllFlowFilesTransferred(ConsumeKinesis.REL_SUCCESS, 2);
+        final List<MockFlowFile> files = runner.getFlowFilesForRelationship(ConsumeKinesis.REL_SUCCESS);
+        files.getFirst().assertContentEquals(GREETING_HELLO);
+        files.getLast().assertContentEquals(newMessage);
+    }
+
     public static void pushDataToKinesis(final String partitionKey, final String data) {
         final PutRecordRequest request = PutRecordRequest.builder()
             .streamName(STREAM_NAME)
@@ -187,6 +233,18 @@ public class ConsumeKinesisNonRecordIT {
         }
 
         throw new RuntimeException("Timed out waiting for Kinesis stream '" + streamName + "' to become active");
+    }
+
+    private static MockProcessSession createFailingSession(final Processor processor) {
+        return new MockProcessSession(
+                new SharedSessionState(processor, new AtomicLong()),
+                processor,
+                true,
+                new MockStateManager(processor),
+                false,
+                false,
+                true
+        );
     }
 }
 
