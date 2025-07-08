@@ -22,8 +22,8 @@ import software.amazon.kinesis.exceptions.InvalidStateException;
 import software.amazon.kinesis.exceptions.KinesisClientLibDependencyException;
 import software.amazon.kinesis.exceptions.ShutdownException;
 import software.amazon.kinesis.exceptions.ThrottlingException;
-import software.amazon.kinesis.retrieval.KinesisClientRecord;
 import software.amazon.kinesis.processor.RecordProcessorCheckpointer;
+import software.amazon.kinesis.retrieval.KinesisClientRecord;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -46,7 +46,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import static java.util.Collections.emptyList;
 
 /**
- * RecordBuffer manages all shard buffers, buffer lifecycle, exclusive read access via leasing,
+ * RecordBuffer keeps track of all created Shard buffers, including exclusive read access via leasing,
  * and memory consumption tracking. It acts as the main interface between KCL callbacks and
  * the ConsumeKinesis processor, routing events to appropriate ShardBuffers and ensuring
  * thread-safe operations.
@@ -62,13 +62,13 @@ final class RecordBuffer {
 
     /**
      * A queue with shard buffers that are available for consumption.
-     * Note: when a buffer is invalidated it is NOT removed from the queue immediately.
+     * Note: when a buffer is invalidated it is NOT removed from the queue.
      */
     private final BlockingQueue<ShardBufferId> buffersWithData = new LinkedBlockingQueue<>();
 
     RecordBuffer(final ComponentLog logger, final long maxMemoryBytes) {
         this.logger = logger;
-        this.memoryTracker = new BlockingMemoryTracker(maxMemoryBytes);
+        this.memoryTracker = new BlockingMemoryTracker(logger, maxMemoryBytes);
     }
 
     // ========== Methods called from Kinesis Client Library ==========
@@ -89,19 +89,41 @@ final class RecordBuffer {
 
         final ShardBuffer buffer = shardBuffers.get(bufferId);
         if (buffer == null) {
+            logger.debug("Buffer with id {} not found. Cannot add records with sequence and subsequence numbers: {}.{} - {}.{}",
+                    bufferId,
+                    records.getFirst().sequenceNumber(),
+                    records.getFirst().subSequenceNumber(),
+                    records.getLast().sequenceNumber(),
+                    records.getLast().subSequenceNumber());
             return;
         }
 
         memoryTracker.addRecordsMemory(records);
         final ShardBufferOfferResult result = buffer.offer(records, checkpointer);
-        if (result.addedRecords()) {
-            if (result.bufferWasEmpty()) {
-                // If the buffer was empty before, we can make it available for consumption.
-                buffersWithData.add(bufferId);
+        switch (result) {
+            case ShardBufferOfferResult.Added r -> {
+                logger.debug("Successfully added records with sequence and subsequence numbers: {}.{} - {}.{} to buffer {}",
+                        records.getFirst().sequenceNumber(),
+                        records.getFirst().subSequenceNumber(),
+                        records.getLast().sequenceNumber(),
+                        records.getLast().subSequenceNumber(),
+                        buffer);
+
+                if (r.bufferWasEmpty()) {
+                    logger.debug("Making the buffer {} available for lease, as it has been added new records", bufferId);
+                    buffersWithData.add(bufferId);
+                }
             }
-        } else {
-            // If the records were not added for any reason, we should free memory for these records.
-            memoryTracker.freeRecordsMemory(records);
+            case ShardBufferOfferResult.BufferInvalidated __ -> {
+                // If the buffer was already invalidated, we should free memory for these records.
+                logger.debug("Buffer with id {} was invalidated. Cannot add records with sequence and subsequence numbers: {}.{} - {}.{}",
+                        bufferId,
+                        records.getFirst().sequenceNumber(),
+                        records.getFirst().subSequenceNumber(),
+                        records.getLast().sequenceNumber(),
+                        records.getLast().subSequenceNumber());
+                memoryTracker.freeRecordsMemory(records);
+            }
         }
     }
 
@@ -110,13 +132,16 @@ final class RecordBuffer {
      */
     void finishConsumption(final ShardBufferId bufferId, final RecordProcessorCheckpointer checkpointer) {
         final ShardBuffer buffer = shardBuffers.get(bufferId);
+        if (buffer == null) {
+            logger.debug("Buffer with id {} not found. Cannot checkpoint last record", bufferId);
+            return;
+        }
 
         logger.info("Finishing consumption for buffer {}. Checkpointing last record", bufferId);
+        buffer.finishRecordConsumption(checkpointer);
 
-        if (buffer != null) {
-            buffer.finishRecordConsumption(checkpointer);
-            shardBuffers.remove(bufferId);
-        }
+        logger.debug("Removing buffer with id {} after successful last record checkpoint", bufferId);
+        shardBuffers.remove(bufferId);
     }
 
     /**
@@ -149,6 +174,7 @@ final class RecordBuffer {
 
             // By the time the bufferId is polled, it might have been invalidated already.
             if (shardBuffers.containsKey(bufferId)) {
+                logger.debug("Acquired lease for buffer {}", bufferId);
                 return Optional.of(new ShardBufferLease(bufferId));
             }
         }
@@ -163,9 +189,12 @@ final class RecordBuffer {
         final ShardBufferId bufferId = lease.bufferId;
 
         final ShardBuffer buffer = shardBuffers.get(bufferId);
-        return buffer == null
-                ? emptyList()
-                : buffer.consumeRecords();
+        if (buffer == null) {
+            logger.debug("Buffer with id {} not found. Cannot consume records", bufferId);
+            return emptyList();
+        }
+
+        return buffer.consumeRecords();
     }
 
     void commitConsumedRecords(final ShardBufferLease lease) {
@@ -177,11 +206,13 @@ final class RecordBuffer {
         final ShardBufferId bufferId = lease.bufferId;
 
         final ShardBuffer buffer = shardBuffers.get(bufferId);
-
-        if (buffer != null) {
-            final List<KinesisClientRecord> consumedRecords = buffer.commitConsumedRecords();
-            memoryTracker.freeRecordsMemory(consumedRecords);
+        if (buffer == null) {
+            logger.debug("Buffer with id {} not found. Cannot commit consumed records", bufferId);
+            return;
         }
+
+        final List<KinesisClientRecord> consumedRecords = buffer.commitConsumedRecords();
+        memoryTracker.freeRecordsMemory(consumedRecords);
     }
 
     void rollbackConsumedRecords(final ShardBufferLease lease) {
@@ -209,6 +240,7 @@ final class RecordBuffer {
 
         // If a buffer has any pending records we want to make it available for consumption immediately.
         if (buffer != null && buffer.hasUnprocessedRecords()) {
+            logger.debug("Making the buffer {} available for lease, as it has more unprocessed records", bufferId);
             buffersWithData.add(bufferId);
         }
     }
@@ -235,13 +267,16 @@ final class RecordBuffer {
 
         private static final long AWAIT_MILLIS = 100;
 
+        private final ComponentLog logger;
+
         private final long maxMemoryBytes;
 
         private long consumedMemoryBytes = 0;
         private final Lock memoryGaugeLock = new ReentrantLock();
         private final Condition decreasedConsumedMemoryCondition = memoryGaugeLock.newCondition();
 
-        BlockingMemoryTracker(final long maxMemoryBytes) {
+        BlockingMemoryTracker(ComponentLog logger, final long maxMemoryBytes) {
+            this.logger = logger;
             this.maxMemoryBytes = maxMemoryBytes;
         }
 
@@ -268,6 +303,8 @@ final class RecordBuffer {
                 }
 
                 consumedMemoryBytes += consumedBytes;
+                logger.debug("Reserved {} bytes for {} records. Total consumed memory: {} bytes",
+                        consumedBytes, newRecords.size(), consumedMemoryBytes);
             } finally {
                 memoryGaugeLock.unlock();
             }
@@ -287,6 +324,8 @@ final class RecordBuffer {
                 }
 
                 consumedMemoryBytes -= freedBytes;
+                logger.debug("Freed {} bytes for {} records. Total consumed memory: {} bytes",
+                        freedBytes, consumedRecords.size(), consumedMemoryBytes);
                 decreasedConsumedMemoryCondition.signalAll();
             } finally {
                 memoryGaugeLock.unlock();
@@ -302,19 +341,31 @@ final class RecordBuffer {
         }
     }
 
-    private record ShardBufferOfferResult(boolean addedRecords, boolean bufferWasEmpty) {
-        static ShardBufferOfferResult notAdded() {
-            return new ShardBufferOfferResult(false, true);
+    private sealed interface ShardBufferOfferResult permits
+            ShardBufferOfferResult.Added, ShardBufferOfferResult.BufferInvalidated {
+
+        record Added(boolean bufferWasEmpty) implements ShardBufferOfferResult {
+        }
+        record BufferInvalidated() implements ShardBufferOfferResult {
+        }
+
+        static ShardBufferOfferResult invalidated() {
+            return new BufferInvalidated();
         }
 
         static ShardBufferOfferResult added(final boolean bufferWasEmpty) {
-            return new ShardBufferOfferResult(true, bufferWasEmpty);
+            return new Added(bufferWasEmpty);
         }
     }
 
     /**
-     * ShardBuffer implements the two-queue system (PENDING/IN_PROGRESS) for a single shard.
-     * todo better docs
+     * ShardBuffer stores all records for a single shard in two queues:
+     * - IN_PROGRESS: records that have been consumed but not yet checkpointed.
+     * - PENDING: records that have been added but not yet consumed.
+     * <p>
+     * When consuming records all PENDING record are moved to IN_PROGRESS.
+     * After a successful checkpoint all IN_PROGRESS records are cleared.
+     * After a rollback all IN_PROGRESS records are kept, allowing to retry consumption.
      */
     private static class ShardBuffer {
 
@@ -351,13 +402,13 @@ final class RecordBuffer {
 
         ShardBufferOfferResult offer(final List<KinesisClientRecord> records, final RecordProcessorCheckpointer recordsCheckpointer) {
             if (invalidated.get()) {
-                return ShardBufferOfferResult.notAdded();
+                return ShardBufferOfferResult.invalidated();
             }
 
             recordsLock.lock();
             try {
                 if (invalidated.get()) {
-                    return ShardBufferOfferResult.notAdded();
+                    return ShardBufferOfferResult.invalidated();
                 }
 
                 final boolean wasEmpty = inProgressRecords.isEmpty() && pendingRecords.isEmpty();

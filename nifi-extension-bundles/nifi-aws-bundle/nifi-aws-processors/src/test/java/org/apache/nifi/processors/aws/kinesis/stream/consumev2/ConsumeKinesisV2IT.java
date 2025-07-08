@@ -74,7 +74,7 @@ import static org.junit.jupiter.api.Timeout.ThreadMode.SEPARATE_THREAD;
  * Tests run in parallel to optimize execution time as Kinesis consumer coordination takes a lot.
  */
 @Execution(ExecutionMode.CONCURRENT)
-@Timeout(value = 15, unit = MINUTES, threadMode = SEPARATE_THREAD)
+@Timeout(value = 5, unit = MINUTES, threadMode = SEPARATE_THREAD)
 class ConsumeKinesisV2IT {
 
     private static final Logger logger = LoggerFactory.getLogger(ConsumeKinesisV2IT.class);
