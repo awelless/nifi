@@ -29,7 +29,7 @@ org.apache.nifi.processors.aws.lambda.PutLambda
 org.apache.nifi.processors.aws.kinesis.firehose.PutKinesisFirehose
 org.apache.nifi.processors.aws.kinesis.stream.PutKinesisStream
 org.apache.nifi.processors.aws.kinesis.stream.ConsumeKinesisStream
-org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2
+org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2
 org.apache.nifi.processors.aws.dynamodb.GetDynamoDB
 org.apache.nifi.processors.aws.dynamodb.PutDynamoDB
 org.apache.nifi.processors.aws.dynamodb.PutDynamoDBRecord

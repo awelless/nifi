@@ -64,7 +64,7 @@ import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.mapping;
 import static java.util.stream.Collectors.toList;
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2.REL_SUCCESS;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2.REL_SUCCESS;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -75,9 +75,9 @@ import static org.junit.jupiter.api.Timeout.ThreadMode.SEPARATE_THREAD;
  */
 @Execution(ExecutionMode.CONCURRENT)
 @Timeout(value = 5, unit = MINUTES, threadMode = SEPARATE_THREAD)
-class ConsumeKinesisV2IT {
+class ConsumeKinesisStreamV2IT {
 
-    private static final Logger logger = LoggerFactory.getLogger(ConsumeKinesisV2IT.class);
+    private static final Logger logger = LoggerFactory.getLogger(ConsumeKinesisStreamV2IT.class);
     private static final DockerImageName LOCALSTACK_IMAGE = DockerImageName.parse("localstack/localstack:4.6.0");
 
     private static final LocalStackContainer localstack = new LocalStackContainer(LOCALSTACK_IMAGE)
@@ -305,7 +305,7 @@ class ConsumeKinesisV2IT {
         // Initialize the processor.
         runner.run(1, false, true);
 
-        final ConsumeKinesisV2 processor = (ConsumeKinesisV2) runner.getProcessor();
+        final ConsumeKinesisStreamV2 processor = (ConsumeKinesisStreamV2) runner.getProcessor();
 
         final String firstMessage = "Initial-Rollback-Message";
         streamClient.putRecord("key", firstMessage);
@@ -337,7 +337,7 @@ class ConsumeKinesisV2IT {
 
 
     private TestRunner createTestRunner(final String streamName, final String applicationName) throws InitializationException {
-        final TestRunner runner = TestRunners.newTestRunner(ConsumeKinesisV2.class);
+        final TestRunner runner = TestRunners.newTestRunner(ConsumeKinesisStreamV2.class);
 
         final AWSCredentialsProviderControllerService credentialsService = new AWSCredentialsProviderControllerService();
         runner.addControllerService("credentials", credentialsService);
@@ -345,20 +345,20 @@ class ConsumeKinesisV2IT {
         runner.setProperty(credentialsService, AWSCredentialsProviderControllerService.SECRET_KEY, localstack.getSecretKey());
         runner.enableControllerService(credentialsService);
 
-        runner.setProperty(ConsumeKinesisV2.AWS_CREDENTIALS_PROVIDER_SERVICE, "credentials");
-        runner.setProperty(ConsumeKinesisV2.KINESIS_STREAM_NAME, streamName);
-        runner.setProperty(ConsumeKinesisV2.APPLICATION_NAME, applicationName);
-        runner.setProperty(ConsumeKinesisV2.REGION, localstack.getRegion());
-        runner.setProperty(ConsumeKinesisV2.INITIAL_POSITION, ConsumeKinesisV2.InitialPosition.TRIM_HORIZON);
+        runner.setProperty(ConsumeKinesisStreamV2.AWS_CREDENTIALS_PROVIDER_SERVICE, "credentials");
+        runner.setProperty(ConsumeKinesisStreamV2.KINESIS_STREAM_NAME, streamName);
+        runner.setProperty(ConsumeKinesisStreamV2.APPLICATION_NAME, applicationName);
+        runner.setProperty(ConsumeKinesisStreamV2.REGION, localstack.getRegion());
+        runner.setProperty(ConsumeKinesisStreamV2.INITIAL_POSITION, ConsumeKinesisStreamV2.InitialPosition.TRIM_HORIZON);
 
-        runner.setProperty(ConsumeKinesisV2.ENDPOINT_OVERRIDE, localstack.getEndpointOverride(Service.KINESIS).toString());
-        runner.setProperty(ConsumeKinesisV2.DYNAMODB_ENDPOINT_OVERRIDE, localstack.getEndpointOverride(Service.DYNAMODB).toString());
-        runner.setProperty(ConsumeKinesisV2.CLOUDWATCH_ENDPOINT_OVERRIDE, localstack.getEndpointOverride(Service.CLOUDWATCH).toString());
+        runner.setProperty(ConsumeKinesisStreamV2.ENDPOINT_OVERRIDE, localstack.getEndpointOverride(Service.KINESIS).toString());
+        runner.setProperty(ConsumeKinesisStreamV2.DYNAMODB_ENDPOINT_OVERRIDE, localstack.getEndpointOverride(Service.DYNAMODB).toString());
+        runner.setProperty(ConsumeKinesisStreamV2.CLOUDWATCH_ENDPOINT_OVERRIDE, localstack.getEndpointOverride(Service.CLOUDWATCH).toString());
 
-        runner.setProperty(ConsumeKinesisV2.REPORT_CLOUDWATCH_METRICS, "false");
+        runner.setProperty(ConsumeKinesisStreamV2.REPORT_CLOUDWATCH_METRICS, "false");
 
-        runner.setProperty(ConsumeKinesisV2.MAX_BYTES_TO_BUFFER, "10 MB");
-        runner.setProperty(ConsumeKinesisV2.TIMEOUT, "30 secs");
+        runner.setProperty(ConsumeKinesisStreamV2.MAX_BYTES_TO_BUFFER, "10 MB");
+        runner.setProperty(ConsumeKinesisStreamV2.TIMEOUT, "30 secs");
 
         runner.assertValid();
         return runner;

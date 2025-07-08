@@ -4,7 +4,7 @@ import software.amazon.kinesis.retrieval.KinesisClientRecord;
 
 import java.util.Map;
 
-final class ConsumeKinesisV2Attributes {
+final class ConsumeKinesisStreamV2Attributes {
     private static final String PREFIX = "aws.kinesis.";
 
     // AWS Kinesis attributes.
@@ -31,6 +31,6 @@ final class ConsumeKinesisV2Attributes {
         );
     }
 
-    private ConsumeKinesisV2Attributes() {
+    private ConsumeKinesisStreamV2Attributes() {
     }
 }

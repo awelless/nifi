@@ -25,8 +25,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2Attributes.RECORD_COUNT;
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2Attributes.RECORD_ERROR_MESSAGE;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2Attributes.RECORD_COUNT;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2Attributes.RECORD_ERROR_MESSAGE;
 
 final class KinesisRecordProcessor {
 
@@ -97,7 +97,7 @@ final class KinesisRecordProcessor {
             if (currentFlowFile != null && writer != null) {
                 try {
                     final WriteResult writeResult = writer.finishRecordSet();
-                    session.putAllAttributes(currentFlowFile, ConsumeKinesisV2Attributes.forKinesisRecord(shardId, lastRecord));
+                    session.putAllAttributes(currentFlowFile, ConsumeKinesisStreamV2Attributes.forKinesisRecord(shardId, lastRecord));
 
                     session.putAttribute(currentFlowFile, CoreAttributes.MIME_TYPE.key(), writer.getMimeType());
                     session.putAttribute(currentFlowFile, RECORD_COUNT, String.valueOf(writeResult.getRecordCount()));
@@ -149,7 +149,7 @@ final class KinesisRecordProcessor {
             final KinesisClientRecord record,
             final Exception e) {
         final FlowFile flowFile = session.create();
-        session.putAllAttributes(flowFile, ConsumeKinesisV2Attributes.forKinesisRecord(shardId, record));
+        session.putAllAttributes(flowFile, ConsumeKinesisStreamV2Attributes.forKinesisRecord(shardId, record));
         session.putAttribute(flowFile, RECORD_ERROR_MESSAGE, e.getLocalizedMessage());
 
         // Write raw record data

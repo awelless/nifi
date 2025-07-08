@@ -77,13 +77,13 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2Attributes.APPROXIMATE_ARRIVAL_TIMESTAMP;
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2Attributes.PARTITION_KEY;
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2Attributes.RECORD_COUNT;
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2Attributes.RECORD_ERROR_MESSAGE;
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2Attributes.SEQUENCE_NUMBER;
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2Attributes.SHARD_ID;
-import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisV2Attributes.SUB_SEQUENCE_NUMBER;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2Attributes.APPROXIMATE_ARRIVAL_TIMESTAMP;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2Attributes.PARTITION_KEY;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2Attributes.RECORD_COUNT;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2Attributes.RECORD_ERROR_MESSAGE;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2Attributes.SEQUENCE_NUMBER;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2Attributes.SHARD_ID;
+import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKinesisStreamV2Attributes.SUB_SEQUENCE_NUMBER;
 
 @InputRequirement(InputRequirement.Requirement.INPUT_FORBIDDEN)
 @TriggerSerially
@@ -108,7 +108,7 @@ import static org.apache.nifi.processors.aws.kinesis.stream.consumev2.ConsumeKin
                 description = "This attribute provides on failure the error message encountered by the Record Reader or Record Writer (if configured)")
 })
 @DefaultSettings(yieldDuration = "10 millis")
-public class ConsumeKinesisV2 extends AbstractProcessor {
+public class ConsumeKinesisStreamV2 extends AbstractProcessor {
 
     public enum InitialPosition implements DescribedValue {
         TRIM_HORIZON("Trim Horizon", "Start reading at the last untrimmed record in the shard in the system, which is the oldest data record in the shard."),
@@ -475,7 +475,7 @@ public class ConsumeKinesisV2 extends AbstractProcessor {
     private static void processRecordsAsRaw(final ProcessSession session, final String shardId, final List<KinesisClientRecord> records) {
         for (final KinesisClientRecord record : records) {
             final FlowFile flowFile = session.create();
-            session.putAllAttributes(flowFile, ConsumeKinesisV2Attributes.forKinesisRecord(shardId, record));
+            session.putAllAttributes(flowFile, ConsumeKinesisStreamV2Attributes.forKinesisRecord(shardId, record));
 
             session.write(flowFile, out -> Channels.newChannel(out).write(record.data()));
 

@@ -48,7 +48,7 @@ import static java.util.Collections.emptyList;
 /**
  * RecordBuffer keeps track of all created Shard buffers, including exclusive read access via leasing,
  * and memory consumption tracking. It acts as the main interface between KCL callbacks and
- * the ConsumeKinesis processor, routing events to appropriate ShardBuffers and ensuring
+ * the ConsumeKinesisStreamV2 processor, routing events to appropriate ShardBuffers and ensuring
  * thread-safe operations.
  */
 final class RecordBuffer {
