@@ -21,6 +21,7 @@ import org.apache.nifi.json.JsonRecordSetWriter;
 import org.apache.nifi.json.JsonTreeReader;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.processors.aws.kinesis.ReaderRecordProcessor.ProcessingResult;
+import org.apache.nifi.processors.aws.kinesis.converter.ValueRecordConverter;
 import org.apache.nifi.reporting.InitializationException;
 import org.apache.nifi.schema.access.SchemaAccessUtils;
 import org.apache.nifi.schema.inference.SchemaInferenceUtil;
@@ -71,8 +72,8 @@ class ReaderRecordProcessorTest {
     private MockProcessSession session;
     private ComponentLog logger;
 
-    private JsonTreeReader jsonReader;
     private JsonRecordSetWriter jsonWriter;
+    private ReaderRecordProcessor processor;
 
     @BeforeEach
     void setUp() throws InitializationException {
@@ -81,7 +82,7 @@ class ReaderRecordProcessorTest {
         session = new MockProcessSession(sharedState, runner.getProcessor());
         logger = runner.getLogger();
 
-        jsonReader = new JsonTreeReader();
+        final JsonTreeReader jsonReader = new JsonTreeReader();
         runner.addControllerService("json-reader", jsonReader);
         runner.setProperty(jsonReader, SchemaAccessUtils.SCHEMA_ACCESS_STRATEGY, SchemaInferenceUtil.INFER_SCHEMA.getValue());
         runner.enableControllerService(jsonReader);
@@ -90,12 +91,12 @@ class ReaderRecordProcessorTest {
         runner.addControllerService("json-writer", jsonWriter);
         runner.setProperty(jsonWriter, SchemaAccessUtils.SCHEMA_ACCESS_STRATEGY, SchemaAccessUtils.INHERIT_RECORD_SCHEMA.getValue());
         runner.enableControllerService(jsonWriter);
+
+        processor = new ReaderRecordProcessor(jsonReader, new ValueRecordConverter(), jsonWriter, logger);
     }
 
     @Test
     void testProcessSingleRecord() {
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(jsonReader, jsonWriter, logger);
-
         final KinesisClientRecord record = KinesisClientRecord.builder()
                 .data(ByteBuffer.wrap("{\"name\":\"John\",\"age\":30}".getBytes(UTF_8)))
                 .sequenceNumber("1")
@@ -126,8 +127,6 @@ class ReaderRecordProcessorTest {
 
     @Test
     void testProcessMultipleRecordsWithSameSchema() {
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(jsonReader, jsonWriter, logger);
-
         final List<KinesisClientRecord> records = List.of(
                 createKinesisRecord("{\"name\":\"John\",\"age\":30}", "1"),
                 createKinesisRecord("{\"name\":\"Jane\",\"age\":25}", "2"),
@@ -148,8 +147,6 @@ class ReaderRecordProcessorTest {
 
     @Test
     void testEmptyRecordsList() {
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(jsonReader, jsonWriter, logger);
-
         final ProcessingResult result = processor.processRecords(session, TEST_STREAM_NAME, TEST_SHARD_ID, Collections.emptyList());
 
         assertEquals(0, result.successFlowFiles().size());
@@ -158,8 +155,6 @@ class ReaderRecordProcessorTest {
 
     @Test
     void testSchemaChangeCreatesNewFlowFile() {
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(jsonReader, jsonWriter, logger);
-
         final List<KinesisClientRecord> records = List.of(
                 createKinesisRecord("{\"name\":\"John\",\"age\":30}", "1"),
                 createKinesisRecord("{\"id\":\"123\",\"value\":\"test\"}", "2")
@@ -181,8 +176,6 @@ class ReaderRecordProcessorTest {
 
     @Test
     void testSchemaChangeWithMultipleRecordsInBetween() {
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(jsonReader, jsonWriter, logger);
-
         final List<KinesisClientRecord> records = List.of(
                 createKinesisRecord("{\"name\":\"John\",\"age\":30}", "1"),
                 createKinesisRecord("{\"name\":\"Jane\",\"age\":25}", "2"),
@@ -206,8 +199,6 @@ class ReaderRecordProcessorTest {
 
     @Test
     void testSingleMalformedRecord() {
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(jsonReader, jsonWriter, logger);
-
         final List<KinesisClientRecord> records = List.of(
                 createKinesisRecord("{invalid json}", "1")
         );
@@ -227,8 +218,6 @@ class ReaderRecordProcessorTest {
 
     @Test
     void testMalformedRecordBetweenValid() {
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(jsonReader, jsonWriter, logger);
-
         final List<KinesisClientRecord> records = List.of(
                 createKinesisRecord("{\"name\":\"John\",\"age\":30}", "1"),
                 createKinesisRecord("{invalid json}", "2"),
@@ -265,7 +254,7 @@ class ReaderRecordProcessorTest {
             }
         };
 
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(failingReaderFactory, jsonWriter, logger);
+        final ReaderRecordProcessor processor = new ReaderRecordProcessor(failingReaderFactory, new ValueRecordConverter(), jsonWriter, logger);
 
         final KinesisClientRecord record = createKinesisRecord("{\"name\":\"John\"}", "1");
         final List<KinesisClientRecord> records = List.of(record);
@@ -282,7 +271,7 @@ class ReaderRecordProcessorTest {
 
     @Test
     void testMalformedRecordExceptionDuringReading() {
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(getMalformedRecordExceptionReader(), jsonWriter, logger);
+        final ReaderRecordProcessor processor = new ReaderRecordProcessor(getMalformedRecordExceptionReader(), new ValueRecordConverter(), jsonWriter, logger);
 
         final KinesisClientRecord record = createKinesisRecord("{\"name\":\"John\"}", "1");
         final List<KinesisClientRecord> records = Collections.singletonList(record);
@@ -299,8 +288,6 @@ class ReaderRecordProcessorTest {
 
     @Test
     void testInvalidRecordsWithSchemaEvolution() {
-        final ReaderRecordProcessor processor = new ReaderRecordProcessor(jsonReader, jsonWriter, logger);
-
         final List<KinesisClientRecord> records = List.of(
                 createKinesisRecord("{\"name\":\"John\",\"age\":30}", "1"), // Schema A
                 createKinesisRecord("{\"name\":\"Jane\",\"age\":25}", "2"), // Schema A

@@ -41,6 +41,10 @@ import org.apache.nifi.processors.aws.credentials.provider.service.AWSCredential
 import org.apache.nifi.processors.aws.kinesis.ReaderRecordProcessor.ProcessingResult;
 import org.apache.nifi.processors.aws.kinesis.RecordBuffer.ShardBufferId;
 import org.apache.nifi.processors.aws.kinesis.RecordBuffer.ShardBufferLease;
+import org.apache.nifi.processors.aws.kinesis.converter.InjectMetadataRecordConverter;
+import org.apache.nifi.processors.aws.kinesis.converter.KinesisRecordConverter;
+import org.apache.nifi.processors.aws.kinesis.converter.ValueRecordConverter;
+import org.apache.nifi.processors.aws.kinesis.converter.WrapperRecordConverter;
 import org.apache.nifi.processors.aws.region.RegionUtilV2;
 import org.apache.nifi.proxy.ProxyConfiguration;
 import org.apache.nifi.proxy.ProxyConfigurationService;
@@ -196,6 +200,15 @@ public class ConsumeKinesis extends AbstractProcessor {
             .identifiesControllerService(RecordSetWriterFactory.class)
             .build();
 
+    static final PropertyDescriptor OUTPUT_STRATEGY = new PropertyDescriptor.Builder()
+            .name("Output Strategy")
+            .description("The format used to output a Kinesis Record into a FlowFile Record.")
+            .required(true)
+            .defaultValue(OutputStrategy.USE_VALUE)
+            .allowableValues(OutputStrategy.class)
+            .dependsOn(RECORD_READER)
+            .build();
+
     static final PropertyDescriptor INITIAL_STREAM_POSITION = new PropertyDescriptor.Builder()
             .name("Initial Stream Position")
             .description("The position in the stream where the processor should start reading.")
@@ -256,6 +269,7 @@ public class ConsumeKinesis extends AbstractProcessor {
             REGION,
             RECORD_READER,
             RECORD_WRITER,
+            OUTPUT_STRATEGY,
             INITIAL_STREAM_POSITION,
             STREAM_POSITION_TIMESTAMP,
             MAX_BYTES_TO_BUFFER,
@@ -310,7 +324,8 @@ public class ConsumeKinesis extends AbstractProcessor {
         final RecordReaderFactory recordReaderFactory = context.getProperty(RECORD_READER).asControllerService(RecordReaderFactory.class);
         if (recordReaderFactory != null) {
             final RecordSetWriterFactory recordWriterFactory = context.getProperty(RECORD_WRITER).asControllerService(RecordSetWriterFactory.class);
-            readerRecordProcessor = Optional.of(new ReaderRecordProcessor(recordReaderFactory, recordWriterFactory, getLogger()));
+            final KinesisRecordConverter recordConverter = resolveRecordConverter(context);
+            readerRecordProcessor = Optional.of(new ReaderRecordProcessor(recordReaderFactory, recordConverter, recordWriterFactory, getLogger()));
         }
 
         final Region region = Region.of(context.getProperty(REGION).getValue());
@@ -367,6 +382,16 @@ public class ConsumeKinesis extends AbstractProcessor {
         final Thread schedulerThread = new Thread(kinesisScheduler);
         schedulerThread.setDaemon(true);
         schedulerThread.start();
+    }
+
+    private static KinesisRecordConverter resolveRecordConverter(final ProcessContext context) {
+        final OutputStrategy outputStrategy = context.getProperty(OUTPUT_STRATEGY).asAllowableValue(OutputStrategy.class);
+
+        return switch (outputStrategy) {
+            case USE_VALUE -> new ValueRecordConverter();
+            case USE_WRAPPER -> new WrapperRecordConverter();
+            case INJECT_METADATA -> new InjectMetadataRecordConverter();
+        };
     }
 
     /**
@@ -600,7 +625,7 @@ public class ConsumeKinesis extends AbstractProcessor {
         }
     }
 
-    public enum MetricsDestination implements DescribedValue {
+    enum MetricsDestination implements DescribedValue {
         NONE("None", "The Kinesis Client Library won't publish any metrics."),
         LOGS("Logs", "The Kinesis Client Library will publish metrics with the standard logger."),
         CLOUDWATCH("CloudWatch", "The Kinesis Client Library will publish metrics to Amazon CloudWatch.");
@@ -609,6 +634,36 @@ public class ConsumeKinesis extends AbstractProcessor {
         private final String description;
 
         MetricsDestination(final String displayName, final String description) {
+            this.displayName = displayName;
+            this.description = description;
+        }
+
+        @Override
+        public String getValue() {
+            return name();
+        }
+
+        @Override
+        public String getDisplayName() {
+            return displayName;
+        }
+
+        @Override
+        public String getDescription() {
+            return description;
+        }
+    }
+
+    enum OutputStrategy implements DescribedValue {
+        USE_VALUE("Use Content as Value", "Write only the Kinesis Record value to the FlowFile record."),
+        USE_WRAPPER("Use Wrapper", "Write the Kinesis Record value and metadata into the FlowFile record. (See processor's additional details for more information.)"),
+        INJECT_METADATA("Inject Metadata",
+                "Write the Kinesis Record value to the FlowFile record and add a sub-record to it with metadata. (See processor's additional details for more information.)");
+
+        private final String displayName;
+        private final String description;
+
+        OutputStrategy(final String displayName, final String description) {
             this.displayName = displayName;
             this.description = description;
         }
