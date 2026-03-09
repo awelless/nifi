@@ -38,6 +38,7 @@ import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -265,6 +266,84 @@ class PollingKinesisClientTest {
 
         drainAllResults();
         assertEventuallyNoPendingFetches();
+    }
+
+    /**
+     * Reproduces data loss caused by stale results remaining in the per-shard queue after
+     * a rollback. The scenario for a single shard:
+     *
+     * <ol>
+     *   <li>Fetch loop enqueues R1 (seq 100-200) and R2 (seq 300-400).</li>
+     *   <li>Consumer polls R1 only; R2 remains in the queue (never polled).</li>
+     *   <li>Consumer calls rollbackResults on R1, which sets resetRequested but does NOT
+     *       drain R2 from the queue.</li>
+     *   <li>After rollback, the first result polled from the queue must come from the
+     *       re-fetched sequence (seq 100), not the stale R2 (seq 300). If the stale R2
+     *       is returned first, checkpointing it at 400 permanently skips records 100-299
+     *       that were never written.</li>
+     * </ol>
+     */
+    @Test
+    void testRollbackDrainsStaleResultsFromQueue() throws Exception {
+        final AtomicInteger getRecordsCallCount = new AtomicInteger();
+
+        // no checkpoint -> TRIM_HORIZON
+        when(mockShardManager.readCheckpoint(anyString())).thenReturn(null);
+
+        when(mockKinesisClient.getShardIterator(any(GetShardIteratorRequest.class)))
+                .thenReturn(GetShardIteratorResponse.builder().shardIterator("iter").build());
+
+        when(mockKinesisClient.getRecords(any(GetRecordsRequest.class))).thenAnswer(invocation -> {
+            final int call = getRecordsCallCount.incrementAndGet();
+            return switch (call) {
+                case 1 -> GetRecordsResponse.builder()
+                        .records(record("100", "A"), record("200", "B"))
+                        .nextShardIterator("iter-2").millisBehindLatest(0L).build();
+                case 2 -> GetRecordsResponse.builder()
+                        .records(record("300", "C"), record("400", "D"))
+                        .nextShardIterator("iter-3").millisBehindLatest(0L).build();
+                default -> {
+                    yield GetRecordsResponse.builder()
+                            .records(record("100", "A"), record("200", "B"))
+                            .nextShardIterator("iter-post-reset").millisBehindLatest(0L).build();
+                }
+            };
+        });
+
+        // Step 1: Start the fetch loop. It enqueues R1 (seq 100-200) then R2 (seq 300-400).
+        consumer.startFetches(shards("shard-1"), "test-stream", 1000, "TRIM_HORIZON", mockShardManager);
+
+        // Step 2: Poll only R1. R2 stays in the queue untouched.
+        final ShardFetchResult r1 = consumer.pollAnyResult(5, TimeUnit.SECONDS);
+        assertNotNull(r1, "R1 must be available");
+        assertEquals("100", r1.firstSequenceNumber());
+
+        // Wait for R2 to be enqueued before triggering rollback.
+        final long r2Deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < r2Deadline) {
+            if (getRecordsCallCount.get() >= 2) {
+                break;
+            }
+            Thread.sleep(20);
+        }
+        Thread.sleep(50);
+
+        // Step 3: Rollback R1.
+        consumer.rollbackResults(List.of(r1));
+
+        // Step 4: Wait for the fetch loop to reset and enqueue the re-fetched result.
+        final long resetDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (getRecordsCallCount.get() < 3 && System.nanoTime() < resetDeadline) {
+            Thread.sleep(20);
+        }
+        Thread.sleep(100);
+
+        // Step 5: Poll the first result from the queue. It must be the re-fetched data
+        // starting at seq 100, not the stale R2 at seq 300. -- OUT OF ORDER
+        final ShardFetchResult firstAfterRollback = consumer.pollShardResult("shard-1");
+        assertNotNull(firstAfterRollback, "Queue must contain results after rollback + re-fetch");
+        assertEquals("100", firstAfterRollback.firstSequenceNumber(),
+                "First result after rollback must be re-fetched data, not a stale pre-rollback result");
     }
 
     private void drainAllResults() throws InterruptedException {
