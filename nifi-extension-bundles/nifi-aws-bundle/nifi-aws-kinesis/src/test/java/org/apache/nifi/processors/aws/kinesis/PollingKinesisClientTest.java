@@ -38,12 +38,14 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -410,6 +412,98 @@ class PollingKinesisClientTest {
         assertNotNull(firstAfterRollback, "Queue must contain results after rollback + re-fetch");
         assertEquals(new BigInteger("500"), firstAfterRollback.firstSequenceNumber(),
                 "First result after rollback must be re-fetched data, not a stale pre-rollback result");
+    }
+
+    /**
+     * Reproduces a race condition between rollbackResults and a concurrent consumer polling
+     * from the same shard queue. The scenario:
+     *
+     * <ol>
+     *   <li>Fetch loop enqueues R1 (seq 100-200), then R2 (seq 300-400).</li>
+     *   <li>The third GetRecords call blocks, freezing the fetch loop inside fetchRecords
+     *       so it cannot loop back to check the reset flag.</li>
+     *   <li>Consumer A polls R1, then calls rollbackResults — setting resetRequested.</li>
+     *   <li>While the fetch loop is still blocked, Consumer B polls R2 from the queue.
+     *       This is the stale result that should have been drained by the reset path.</li>
+     *   <li>The fetch loop is unblocked. It loops back, sees the reset flag, drains the
+     *       queue (now empty — R2 already leaked), and re-acquires the iterator from
+     *       checkpoint.</li>
+     * </ol>
+     *
+     * <p>This demonstrates that a concurrent consumer can read stale (pre-rollback) data
+     * from the queue because rollbackResults only sets a flag — the actual drain happens
+     * asynchronously in the fetch loop thread.
+     */
+    @Test
+    void testRollbackRaceAllowsStaleResultToBePolledByConcurrentConsumer() throws Exception {
+        final CountDownLatch fetchLoopBlocked = new CountDownLatch(1);
+        final CountDownLatch unblockFetchLoop = new CountDownLatch(1);
+        final AtomicInteger getRecordsCallCount = new AtomicInteger();
+
+        when(mockShardManager.readCheckpoint(anyString())).thenReturn(null);
+        when(mockKinesisClient.getShardIterator(any(GetShardIteratorRequest.class)))
+                .thenReturn(GetShardIteratorResponse.builder().shardIterator("iter-1").build());
+
+        when(mockKinesisClient.getRecords(any(GetRecordsRequest.class))).thenAnswer(invocation -> {
+            final int call = getRecordsCallCount.incrementAndGet();
+            final GetRecordsRequest req = invocation.getArgument(0);
+
+            if (call == 1) {
+                // R1: seq 100-200
+                return GetRecordsResponse.builder()
+                        .records(record("100", "A"), record("200", "B"))
+                        .nextShardIterator("iter-1a").millisBehindLatest(0L).build();
+            }
+            if (call == 2) {
+                // R2: seq 300-400
+                return GetRecordsResponse.builder()
+                        .records(record("300", "C"), record("400", "D"))
+                        .nextShardIterator("iter-1b").millisBehindLatest(0L).build();
+            }
+            if (call == 3) {
+                // Block the fetch loop here — it has enqueued R1 and R2 but hasn't
+                // looped back to check resetRequested yet.
+                fetchLoopBlocked.countDown();
+                unblockFetchLoop.await(10, TimeUnit.SECONDS);
+                // Return empty so the loop continues to its next iteration where it
+                // will check the reset flag.
+                return GetRecordsResponse.builder()
+                        .records(List.<Record>of())
+                        .nextShardIterator("iter-1c").millisBehindLatest(0L).build();
+            }
+            // Post-reset fetches: return empty to keep the loop alive without noise.
+            return GetRecordsResponse.builder()
+                    .records(List.<Record>of())
+                    .nextShardIterator(req.shardIterator()).millisBehindLatest(0L).build();
+        });
+
+        consumer.startFetches(shards("shard-1"), "test-stream", 1000, "TRIM_HORIZON", mockShardManager);
+
+        // Wait for R1 to appear in the queue.
+        final ShardFetchResult r1 = consumer.pollAnyResult(5, TimeUnit.SECONDS);
+        assertNotNull(r1, "R1 must be available");
+        assertEquals(new BigInteger("100"), r1.firstSequenceNumber());
+
+        // Wait until the fetch loop is blocked inside the third GetRecords call.
+        // At this point R2 is already enqueued and the loop cannot check the reset flag.
+        fetchLoopBlocked.await(5, TimeUnit.SECONDS);
+
+        // Consumer A rolls back R1 — this only sets resetRequested = true on the state.
+        consumer.rollbackResults(List.of(r1));
+
+        // Consumer B attempts to poll from the same shard while the fetch loop is still
+        // blocked. After a correct rollback implementation, the queue should already be
+        // drained — R2 must not be available to a concurrent consumer.
+        final ShardFetchResult staleR2 = consumer.pollShardResult("shard-1");
+
+        // Unblock the fetch loop so the test can shut down cleanly.
+        unblockFetchLoop.countDown();
+
+        // A correct implementation drains the queue synchronously in rollbackResults,
+        // so no stale result should be pollable after the rollback call returns.
+        assertNull(staleR2, "After rollback, stale results (R2) must not be pollable by a "
+                + "concurrent consumer — rollbackResults should drain the queue synchronously "
+                + "rather than deferring to the fetch loop thread");
     }
 
     private void drainAllResults() throws InterruptedException {
