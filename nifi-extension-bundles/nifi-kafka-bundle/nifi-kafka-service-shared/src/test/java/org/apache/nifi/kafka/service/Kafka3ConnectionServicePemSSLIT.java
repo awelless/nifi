@@ -20,13 +20,22 @@ import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.nifi.kafka.shared.property.KafkaClientProperty;
 import org.apache.nifi.kafka.shared.property.SecurityProtocol;
 import org.apache.nifi.reporting.InitializationException;
-import org.apache.nifi.ssl.StandardSSLContextService;
+import org.apache.nifi.ssl.PEMEncodedSSLContextProvider;
 import org.apache.nifi.util.TestRunner;
 
+import java.security.cert.CertificateEncodingException;
+import java.security.cert.X509Certificate;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-public class Kafka3ConnectionServiceSSLIT extends Kafka3ConnectionServiceBaseIT {
+/**
+ * Integration test exercising the PEMEncodedSSLContextProvider path through the unified
+ * {@link org.apache.nifi.kafka.service.ssl.SslContextSslEngineFactory}.
+ */
+public class Kafka3ConnectionServicePemSSLIT extends Kafka3ConnectionServiceBaseIT {
+
+    private static final String PEM_LINE_LENGTH_PATTERN = "(.{64})";
 
     @Override
     protected Map<String, String> getKafkaContainerConfigProperties() {
@@ -49,7 +58,7 @@ public class Kafka3ConnectionServiceSSLIT extends Kafka3ConnectionServiceBaseIT 
     protected Map<String, String> getKafkaServiceConfigProperties() throws InitializationException {
         final Map<String, String> properties = new LinkedHashMap<>(super.getKafkaServiceConfigProperties());
         properties.put(Kafka3ConnectionService.SECURITY_PROTOCOL.getName(), SecurityProtocol.SSL.name());
-        properties.put(Kafka3ConnectionService.SSL_CONTEXT_SERVICE.getName(), addSslContextService(runner));
+        properties.put(Kafka3ConnectionService.SSL_CONTEXT_SERVICE.getName(), addSslContextProvider(runner));
         return properties;
     }
 
@@ -67,18 +76,30 @@ public class Kafka3ConnectionServiceSSLIT extends Kafka3ConnectionServiceBaseIT 
         return properties;
     }
 
-    private String addSslContextService(final TestRunner runner) throws InitializationException {
-        final String identifier = StandardSSLContextService.class.getSimpleName();
-        final StandardSSLContextService service = new StandardSSLContextService();
-        runner.addControllerService(identifier, service);
-        runner.setProperty(service, StandardSSLContextService.KEYSTORE, keyStorePath.toString());
-        runner.setProperty(service, StandardSSLContextService.KEYSTORE_TYPE, keyStoreType);
-        runner.setProperty(service, StandardSSLContextService.KEYSTORE_PASSWORD, KEY_STORE_PASSWORD);
-        runner.setProperty(service, "Key Password", KEY_PASSWORD);
-        runner.setProperty(service, StandardSSLContextService.TRUSTSTORE, trustStorePath.toString());
-        runner.setProperty(service, StandardSSLContextService.TRUSTSTORE_TYPE, keyStoreType);
-        runner.setProperty(service, StandardSSLContextService.TRUSTSTORE_PASSWORD, KEY_STORE_PASSWORD);
-        runner.enableControllerService(service);
+    private String addSslContextProvider(final TestRunner runner) throws InitializationException {
+        final String identifier = PEMEncodedSSLContextProvider.class.getSimpleName();
+        final PEMEncodedSSLContextProvider provider = new PEMEncodedSSLContextProvider();
+        runner.addControllerService(identifier, provider);
+        final String pemPrivateKey = toPem("PRIVATE KEY", keyPair.getPrivate().getEncoded());
+        final String pemCertificate = toPem("CERTIFICATE", encodeCertificate(certificate));
+        runner.setProperty(provider, "Private Key", pemPrivateKey);
+        runner.setProperty(provider, "Certificate Chain", pemCertificate);
+        runner.setProperty(provider, "Certificate Authorities", pemCertificate);
+        runner.enableControllerService(provider);
         return identifier;
+    }
+
+    private static String toPem(final String label, final byte[] bytes) {
+        final String base64 = Base64.getEncoder().encodeToString(bytes);
+        final String wrapped = base64.replaceAll(PEM_LINE_LENGTH_PATTERN, "$1\n");
+        return "-----BEGIN " + label + "-----\n" + wrapped + "\n-----END " + label + "-----";
+    }
+
+    private static byte[] encodeCertificate(final X509Certificate cert) {
+        try {
+            return cert.getEncoded();
+        } catch (final CertificateEncodingException e) {
+            throw new IllegalStateException("Failed to encode certificate to PEM", e);
+        }
     }
 }

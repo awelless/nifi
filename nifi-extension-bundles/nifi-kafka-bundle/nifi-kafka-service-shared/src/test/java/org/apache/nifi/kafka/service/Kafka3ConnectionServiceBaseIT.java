@@ -140,6 +140,10 @@ public class Kafka3ConnectionServiceBaseIT {
 
     protected static Path trustStorePath;
 
+    protected static KeyPair keyPair;
+
+    protected static X509Certificate certificate;
+
     protected TestRunner runner;
 
     private ConfluentKafkaContainer kafkaContainer;
@@ -148,8 +152,8 @@ public class Kafka3ConnectionServiceBaseIT {
 
     @BeforeAll
     void startContainer() throws Exception {
-        final KeyPair keyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
-        final X509Certificate certificate = new StandardCertificateBuilder(keyPair, new X500Principal("CN=localhost"), Duration.ofHours(1)).build();
+        keyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+        certificate = new StandardCertificateBuilder(keyPair, new X500Principal("CN=localhost"), Duration.ofHours(1)).build();
         final KeyStore keyStore = new EphemeralKeyStoreBuilder()
                 .addPrivateKeyEntry(new KeyStore.PrivateKeyEntry(keyPair.getPrivate(), new Certificate[]{certificate}))
                 .keyPassword(KEY_PASSWORD.toCharArray())
