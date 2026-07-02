@@ -929,17 +929,20 @@ public class TestDataTypeUtils {
 
     @Test
     public void testFindMostSuitableTypeWithDate() {
-        testFindMostSuitableType("1111-11-11", RecordFieldType.DATE.getDataType());
+        // When STRING is not a candidate, a date-formatted string falls back to DATE via ordinal sort.
+        testFindMostSuitableType("1111-11-11", RecordFieldType.DATE.getDataType(), RecordFieldType.STRING.getDataType());
     }
 
     @Test
     public void testFindMostSuitableTypeWithTime() {
-        testFindMostSuitableType("11:22:33", RecordFieldType.TIME.getDataType());
+        // When STRING is not a candidate, a time-formatted string falls back to TIME via ordinal sort.
+        testFindMostSuitableType("11:22:33", RecordFieldType.TIME.getDataType(), RecordFieldType.STRING.getDataType());
     }
 
     @Test
     public void testFindMostSuitableTypeWithTimeStamp() {
-        testFindMostSuitableType("1111-11-11 11:22:33", RecordFieldType.TIMESTAMP.getDataType());
+        // When STRING is not a candidate, a timestamp-formatted string falls back to TIMESTAMP via ordinal sort.
+        testFindMostSuitableType("1111-11-11 11:22:33", RecordFieldType.TIMESTAMP.getDataType(), RecordFieldType.STRING.getDataType());
     }
 
     @Test
@@ -948,8 +951,9 @@ public class TestDataTypeUtils {
     }
 
     @Test
-    public void testFindMostSuitableTypeWithStringShouldReturnChar() {
-        testFindMostSuitableType("abc", RecordFieldType.CHAR.getDataType());
+    public void testFindMostSuitableTypeWithStringShouldReturnString() {
+        // STRING is preferred over CHAR when both are candidates because the value is natively a String.
+        testFindMostSuitableType("abc", RecordFieldType.STRING.getDataType());
     }
 
     @Test
@@ -960,6 +964,78 @@ public class TestDataTypeUtils {
     @Test
     public void testFindMostSuitableTypeWithArray() {
         testFindMostSuitableType(new int[]{1, 2, 3}, RecordFieldType.ARRAY.getArrayDataType(RecordFieldType.INT.getDataType()));
+    }
+
+    // --- String-to-numeric promotion tests ---
+    //
+    // When a JSON field appears as a quoted string in one record and a bare number in another, schema
+    // inference merges the field to CHOICE(INT, STRING). findMostSuitableType then decides which branch
+    // to use at write time:
+    //
+    //   current:  String "2" -> INT  (findMostSuitableTypeByStringValue sorts by enum ordinal; INT(3) < STRING(13))
+    //   desired:  String "2" -> STRING (the value is natively a String; STRING candidate should be preferred)
+    //
+    // Tests marked CURRENT BEHAVIOR pass today and assert the (buggy) result.
+    // Tests marked DESIRED BEHAVIOR fail today and should pass once findMostSuitableType is fixed.
+
+    /** DESIRED BEHAVIOR — currently FAILS: a String value should resolve to STRING, not INT. */
+    @Test
+    public void testFindMostSuitableType_StringNumericValue_WithIntAndString_ShouldReturnString() {
+        final DataType expected = RecordFieldType.STRING.getDataType();
+
+        assertEquals(Optional.of(expected),
+                DataTypeUtils.findMostSuitableType("2", new ArrayList<>(Arrays.asList(RecordFieldType.INT.getDataType(), RecordFieldType.STRING.getDataType())), Function.identity()),
+                "String value '2' should resolve to STRING, not INT");
+        assertEquals(Optional.of(expected),
+                DataTypeUtils.findMostSuitableType("2", new ArrayList<>(Arrays.asList(RecordFieldType.STRING.getDataType(), RecordFieldType.INT.getDataType())), Function.identity()),
+                "Result must not depend on candidate order");
+    }
+
+    /** DESIRED BEHAVIOR — currently FAILS: a String value should resolve to STRING, not BOOLEAN. */
+    @Test
+    public void testFindMostSuitableType_StringBooleanValue_WithBooleanAndString_ShouldReturnString() {
+        final DataType expected = RecordFieldType.STRING.getDataType();
+
+        assertEquals(Optional.of(expected),
+                DataTypeUtils.findMostSuitableType("false", new ArrayList<>(Arrays.asList(RecordFieldType.BOOLEAN.getDataType(), RecordFieldType.STRING.getDataType())), Function.identity()),
+                "String value 'false' should resolve to STRING, not BOOLEAN");
+        assertEquals(Optional.of(expected),
+                DataTypeUtils.findMostSuitableType("false", new ArrayList<>(Arrays.asList(RecordFieldType.STRING.getDataType(), RecordFieldType.BOOLEAN.getDataType())), Function.identity()),
+                "Result must not depend on candidate order");
+    }
+
+    /** CURRENT BEHAVIOR: a native Integer value correctly resolves to INT, regardless of STRING also being present. */
+    @Test
+    public void testFindMostSuitableType_IntegerValue_WithIntAndString_ShouldReturnInt() {
+        final DataType expected = RecordFieldType.INT.getDataType();
+
+        assertEquals(Optional.of(expected),
+                DataTypeUtils.findMostSuitableType(2, new ArrayList<>(Arrays.asList(RecordFieldType.INT.getDataType(), RecordFieldType.STRING.getDataType())), Function.identity()),
+                "Integer value 2 should resolve to INT (exact native-type match)");
+        assertEquals(Optional.of(expected),
+                DataTypeUtils.findMostSuitableType(2, new ArrayList<>(Arrays.asList(RecordFieldType.STRING.getDataType(), RecordFieldType.INT.getDataType())), Function.identity()),
+                "Result must not depend on candidate order");
+    }
+
+    /** CURRENT BEHAVIOR: a non-numeric String value that cannot be converted to INT resolves to STRING. */
+    @Test
+    public void testFindMostSuitableType_StringNonNumericValue_WithIntAndString_ShouldReturnString() {
+        final DataType expected = RecordFieldType.STRING.getDataType();
+
+        assertEquals(Optional.of(expected),
+                DataTypeUtils.findMostSuitableType("abc", new ArrayList<>(Arrays.asList(RecordFieldType.INT.getDataType(), RecordFieldType.STRING.getDataType())), Function.identity()),
+                "Non-numeric String value should resolve to STRING (not convertible to INT)");
+        assertEquals(Optional.of(expected),
+                DataTypeUtils.findMostSuitableType("abc", new ArrayList<>(Arrays.asList(RecordFieldType.STRING.getDataType(), RecordFieldType.INT.getDataType())), Function.identity()),
+                "Result must not depend on candidate order");
+    }
+
+    /** CURRENT BEHAVIOR: a numeric String value converts to INT when STRING is NOT a candidate. */
+    @Test
+    public void testFindMostSuitableType_StringNumericValue_NoStringCandidate_ShouldReturnInt() {
+        assertEquals(Optional.of(RecordFieldType.INT.getDataType()),
+                DataTypeUtils.findMostSuitableType("2", new ArrayList<>(Arrays.asList(RecordFieldType.INT.getDataType())), Function.identity()),
+                "Numeric String '2' should convert to INT when STRING is not a candidate");
     }
 
     private void testFindMostSuitableType(Object value, DataType expected, DataType... filtered) {

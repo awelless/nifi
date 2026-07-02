@@ -110,6 +110,101 @@ class ConsumeKinesisTest {
     }
 
     @Test
+    void testNumericStringIsPreservedWithFloatingPointFieldPresent() throws Exception {
+        // Same field "val" arrives as a numeric STRING in one record and a bare NUMBER in the other, so
+        // schema inference merges "val" into CHOICE(INT, STRING). Each record also carries a floating-point
+        // "amount" (123456789.0), which Jackson serializes as "1.23456789E8".
+        //
+        // DESIRED behavior: the original representation of each record is preserved -- the string "2" stays
+        // quoted. This test asserts that desired behavior and therefore currently FAILS: with the default
+        // writer ("Allow Scientific Notation" = false) the scientific-notation guard rejects the verbatim
+        // fast-path, the writer coerces the CHOICE "val" to its INT branch, and "2" is promoted to a number.
+        // It should turn green once the writer is configured with "Allow Scientific Notation" = true.
+        final List<UserRecord> records = List.of(
+                testRecord("1", "{\"val\":\"2\",\"amount\":123456789.0}"),
+                testRecord("2", "{\"val\":2,\"amount\":123456789.0}"));
+
+        triggerWithRecords(records);
+
+        runner.assertTransferCount(ConsumeKinesis.REL_SUCCESS, 1);
+        runner.assertTransferCount(ConsumeKinesis.REL_PARSE_FAILURE, 0);
+
+        final MockFlowFile success = runner.getFlowFilesForRelationship(ConsumeKinesis.REL_SUCCESS).getFirst();
+        success.assertAttributeEquals("record.count", "2");
+
+        // The first record's value must remain the quoted string "2" (not promoted to a bare number).
+        // "amount" is written without scientific notation by the coerced path (BigDecimal, Allow Scientific Notation=false).
+        success.assertContentEquals("[{\"val\":\"2\",\"amount\":123456789},{\"val\":2,\"amount\":123456789}]");
+    }
+
+    @Test
+    void testSingleRecordWithQuotedNumericStringIsNotNarrowed() throws Exception {
+        // A single record where "val" is a quoted numeric string.
+        // With only one record, schema inference sees TextNode("42") -> STRING.
+        // The field type is plain STRING — no CHOICE is formed.
+        // Type narrowing requires a CHOICE, which only arises when schema inference
+        // merges conflicting types (e.g. STRING from one record and INT from another).
+        // A consistently-quoted field, even with numeric content, is never narrowed.
+        final List<UserRecord> records = List.of(
+                testRecord("1", "{\"val\":\"42\"}"));
+
+        triggerWithRecords(records);
+
+        runner.assertTransferCount(ConsumeKinesis.REL_SUCCESS, 1);
+        runner.assertTransferCount(ConsumeKinesis.REL_PARSE_FAILURE, 0);
+
+        final MockFlowFile success = runner.getFlowFilesForRelationship(ConsumeKinesis.REL_SUCCESS).getFirst();
+        success.assertAttributeEquals("record.count", "1");
+        success.assertContentEquals("[{\"val\":\"42\"}]");
+    }
+
+    @Test
+    void testBothRecordsWithQuotedStringValuePreservedWithFloatingPointField() throws Exception {
+        // Both records have "val" as a quoted string "2". Schema inference sees STRING in every record,
+        // so the field type is plain STRING — no CHOICE is formed.
+        // The float "amount" (123456789.0) still triggers the scientific-notation guard and blocks the
+        // verbatim fast-path, so the writer falls back to field-by-field serialization.
+        // A STRING field is written verbatim in the field-by-field path (no CHOICE, no type promotion),
+        // so "val":"2" must remain quoted in both output records.
+        final List<UserRecord> records = List.of(
+                testRecord("1", "{\"val\":\"2\",\"amount\":123456789.0}"),
+                testRecord("2", "{\"val\":\"2\",\"amount\":123456789.0}"));
+
+        triggerWithRecords(records);
+
+        runner.assertTransferCount(ConsumeKinesis.REL_SUCCESS, 1);
+        runner.assertTransferCount(ConsumeKinesis.REL_PARSE_FAILURE, 0);
+
+        final MockFlowFile success = runner.getFlowFilesForRelationship(ConsumeKinesis.REL_SUCCESS).getFirst();
+        success.assertAttributeEquals("record.count", "2");
+
+        success.assertContentEquals("[{\"val\":\"2\",\"amount\":123456789},{\"val\":\"2\",\"amount\":123456789}]");
+    }
+
+    @Test
+    void testNumericStringAndNumberPreservedWhenAmountIsInteger() throws Exception {
+        // Control for testNumericStringIsPreservedWithFloatingPointFieldPresent: identical records except "amount"
+        // is now an INTEGER (123456789, no decimal point) instead of a double. An integer serializes as
+        // "123456789" with no scientific notation, so the verbatim fast-path is NOT rejected and each record's
+        // original bytes are emitted unchanged. The string "2" stays quoted and the number 2 stays bare,
+        // proving the promotion is driven by scientific notation, not merely by the field's presence.
+        final List<UserRecord> records = List.of(
+                testRecord("1", "{\"val\":\"2\",\"amount\":123456789}"),
+                testRecord("2", "{\"val\":2,\"amount\":123456789}"));
+
+        triggerWithRecords(records);
+
+        runner.assertTransferCount(ConsumeKinesis.REL_SUCCESS, 1);
+        runner.assertTransferCount(ConsumeKinesis.REL_PARSE_FAILURE, 0);
+
+        final MockFlowFile success = runner.getFlowFilesForRelationship(ConsumeKinesis.REL_SUCCESS).getFirst();
+        success.assertAttributeEquals("record.count", "2");
+
+        // Original representation preserved verbatim: string stays quoted, number stays bare.
+        success.assertContentEquals("[{\"val\":\"2\",\"amount\":123456789},{\"val\":2,\"amount\":123456789}]");
+    }
+
+    @Test
     void testSingleInvalidRecordRoutedToParseFailure() throws Exception {
         assertInvalidRecordAtPosition("1", "THIS IS NOT JSON",
                 testRecord("1", "THIS IS NOT JSON"), testRecord("2", "{\"name\":\"Bob\"}"), testRecord("3", "{\"name\":\"Charlie\"}"));

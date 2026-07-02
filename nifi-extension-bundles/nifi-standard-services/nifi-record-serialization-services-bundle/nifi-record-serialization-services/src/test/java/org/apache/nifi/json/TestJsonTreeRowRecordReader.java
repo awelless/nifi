@@ -1375,6 +1375,113 @@ class TestJsonTreeRowRecordReader {
         }
     }
 
+    @Test
+    void testSingleRecordQuotedNumericStringProducesStringType() throws Exception {
+        // A single record where "val" is a quoted numeric string.
+        // Schema inference sees only TextNode("2") and infers STRING — no CHOICE is formed.
+        // The reader therefore returns String "2", not Integer 2.
+        // Type narrowing only occurs when schema inference merges conflicting types
+        // (TextNode + IntNode) into CHOICE(INT, STRING) across multiple records.
+        final byte[] bytes = "{\"val\":\"2\"}".getBytes(StandardCharsets.UTF_8);
+
+        try (final InputStream in = new ByteArrayInputStream(bytes)) {
+            final RecordSchema schema = inferSchema(in, StartingFieldStrategy.ROOT_NODE, null);
+            assertEquals(RecordFieldType.STRING, schema.getDataType("val").orElseThrow().getFieldType(),
+                    "Single quoted-numeric record must infer as STRING, not CHOICE");
+        }
+
+        try (final InputStream in = new ByteArrayInputStream(bytes);
+             final JsonTreeRowRecordReader reader = createJsonTreeRowRecordReader(
+                     in, inferSchema(new ByteArrayInputStream(bytes), StartingFieldStrategy.ROOT_NODE, null))) {
+
+            final Record record = reader.nextRecord();
+            assertInstanceOf(String.class, record.getValue("val"),
+                    "val must be String — no CHOICE means no ordinal-sort promotion");
+            assertEquals("2", record.getValue("val"));
+        }
+    }
+
+    @Test
+    void testMixedQuotedAndBareNumericFieldTypes() throws Exception {
+        // Two records for the same field "val": a quoted string in record 1 and a bare number in record 2.
+        // "amount" is a floating-point value included to mirror the ConsumeKinesis repro scenario
+        // (it causes the JsonRecordSetWriter scientific-notation guard to block the verbatim fast-path).
+        final String inputJson = """
+                {"val":"2","amount":123456789.0}
+                {"val":2,"amount":123456789.0}
+                """;
+
+        final byte[] bytes = inputJson.getBytes(StandardCharsets.UTF_8);
+
+        // ── 1. Schema inference ──────────────────────────────────────────────────────────────────────
+        // JsonSchemaInference sees TextNode("2") -> STRING and IntNode(2) -> INT, then merges to
+        // CHOICE(INT, STRING) for "val".  "amount" is a floating-point literal -> DOUBLE.
+        final RecordSchema schema;
+        try (final InputStream in = new ByteArrayInputStream(bytes)) {
+            schema = inferSchema(in, StartingFieldStrategy.ROOT_NODE, null);
+        }
+
+        final DataType valType = schema.getDataType("val").orElseThrow();
+        assertEquals(RecordFieldType.CHOICE, valType.getFieldType(),
+                "Mixed quoted/bare values should infer as CHOICE");
+
+        final ChoiceDataType choiceType = (ChoiceDataType) valType;
+        assertTrue(choiceType.getPossibleSubTypes().contains(RecordFieldType.INT.getDataType()),
+                "CHOICE should include INT sub-type");
+        assertTrue(choiceType.getPossibleSubTypes().contains(RecordFieldType.STRING.getDataType()),
+                "CHOICE should include STRING sub-type");
+
+        assertEquals(RecordFieldType.DOUBLE, schema.getDataType("amount").orElseThrow().getFieldType(),
+                "Floating-point literal should infer as DOUBLE");
+
+        // ── 2. Read with coerceTypes=false ───────────────────────────────────────────────────────────
+        // Without coercion each record returns the raw Jackson node value:
+        //   TextNode("2") -> java.lang.String "2"
+        //   IntNode(2)    -> java.lang.Integer 2
+        // The distinction between a JSON string and a JSON number is preserved.
+        try (final InputStream in = new ByteArrayInputStream(bytes);
+             final JsonTreeRowRecordReader reader = createJsonTreeRowRecordReader(in, schema)) {
+
+            final Record record1 = reader.nextRecord(false, false);
+            assertInstanceOf(String.class, record1.getValue("val"),
+                    "Record 1: quoted \"2\" should remain a String when not coercing");
+            assertEquals("2", record1.getValue("val"));
+
+            final Record record2 = reader.nextRecord(false, false);
+            assertInstanceOf(Integer.class, record2.getValue("val"),
+                    "Record 2: bare 2 should remain an Integer when not coercing");
+            assertEquals(2, record2.getValue("val"));
+
+            // SerializedForm carries the original JSON bytes for each record — this is what the
+            // JsonRecordSetWriter verbatim fast-path uses to bypass field-by-field serialization.
+            assertTrue(record1.getSerializedForm().isPresent(), "Record 1 should carry a SerializedForm");
+            assertTrue(record1.getSerializedForm().get().getSerialized().toString().contains("\"val\":\"2\""),
+                    "Record 1 SerializedForm should contain the quoted form");
+            assertTrue(record2.getSerializedForm().isPresent(), "Record 2 should carry a SerializedForm");
+            assertTrue(record2.getSerializedForm().get().getSerialized().toString().contains("\"val\":2"),
+                    "Record 2 SerializedForm should contain the bare number form");
+        }
+
+        // ── 3. Read with coerceTypes=true (current NiFi behaviour) ────────────────────────────────
+        // With coercion, CHOICE resolution calls DataTypeUtils.chooseDataType on the raw value.
+        // findMostSuitableTypeByStringValue sorts candidates by RecordFieldType enum ordinal:
+        // INT(3) comes before STRING(13), so String "2" is convertible to INT and is promoted.
+        // Both records produce Integer 2 — the String/Integer distinction visible in (2) is lost.
+        try (final InputStream in = new ByteArrayInputStream(bytes);
+             final JsonTreeRowRecordReader reader = createJsonTreeRowRecordReader(in, schema)) {
+
+            final Record record1 = reader.nextRecord(true, false);
+            assertInstanceOf(Integer.class, record1.getValue("val"),
+                    "Record 1: String \"2\" is coerced to Integer 2 via CHOICE(INT,STRING) ordinal-sort (bug)");
+            assertEquals(2, record1.getValue("val"));
+
+            final Record record2 = reader.nextRecord(true, false);
+            assertInstanceOf(Integer.class, record2.getValue("val"),
+                    "Record 2: bare 2 stays Integer 2");
+            assertEquals(2, record2.getValue("val"));
+        }
+    }
+
     private RecordSchema inferSchema(InputStream jsonStream, StartingFieldStrategy strategy, String startingFieldName) throws IOException {
         RecordSchema schema = new InferSchemaAccessStrategy<>(
             (__, inputStream) -> new JsonRecordSource(inputStream, strategy, startingFieldName, new JsonParserFactory()),

@@ -45,6 +45,7 @@ import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -986,6 +987,69 @@ public class TestCSVRecordReader {
             record = reader.nextRecord(false, false);
             name = (String) record.getValue("name");
             assertEquals("\"\"\"", name);
+        }
+    }
+
+    /**
+     * Regression test for NIFI-6640: a CSV column with mixed numeric and non-numeric values.
+     *
+     * Schema inference produces CHOICE(FLOAT, STRING) for the "Value" column because some cells
+     * parse as FLOAT and one cell is a non-numeric string.
+     *
+     * The NIFI-6640 fix added STRING to the CHOICE so that "some_string" no longer throws
+     * IllegalTypeConversionException.  With STRING present, findMostSuitableTypeByStringValue
+     * sorts candidates by RecordFieldType enum ordinal: FLOAT(6) comes before STRING(13), so
+     * numeric cells are converted to Float and the non-numeric cell falls through to STRING.
+     *
+     * CURRENT BEHAVIOR (all assertions pass):
+     *   numeric cells  → Float  (ordinal sort picks FLOAT first)
+     *   "some_string"  → String (FLOAT not compatible, STRING is)
+     */
+    @Test
+    public void testChoiceFloatStringMixedColumn() throws IOException, MalformedRecordException {
+        // Exact data from the NIFI-6640 bug report.
+        final String csv = "Id|Value\n1|3\n2|3.75\n3|3.85\n4|8\n5|2.0\n6|4.0\n7|some_string\n";
+
+        final CSVFormat pipe = CSVFormat.DEFAULT.builder()
+                .setDelimiter('|').setHeader().setSkipHeaderRecord(true).setTrim(true).get();
+
+        final List<RecordField> fields = new ArrayList<>();
+        fields.add(new RecordField("Id", RecordFieldType.INT.getDataType()));
+        fields.add(new RecordField("Value", RecordFieldType.CHOICE.getChoiceDataType(
+                RecordFieldType.FLOAT.getDataType(), RecordFieldType.STRING.getDataType())));
+        final RecordSchema schema = new SimpleRecordSchema(fields);
+
+        try (final InputStream in = new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8));
+             final CSVRecordReader reader = new CSVRecordReader(in, Mockito.mock(ComponentLog.class), schema, pipe,
+                     true, false, RecordFieldType.DATE.getDefaultFormat(), RecordFieldType.TIME.getDefaultFormat(),
+                     RecordFieldType.TIMESTAMP.getDefaultFormat(), StandardCharsets.UTF_8.name())) {
+
+            // Numeric cells: ordinal sort picks FLOAT(6) before STRING(13), so "3" and "3.75"
+            // are converted to Float — even though their raw cell type is String.
+            final Record r1 = reader.nextRecord();
+            assertInstanceOf(Float.class, r1.getValue("Value"),
+                    "Numeric cell '3' is converted to Float by ordinal-sort CHOICE resolution");
+            assertEquals(3.0f, r1.getValue("Value"));
+
+            final Record r2 = reader.nextRecord();
+            assertInstanceOf(Float.class, r2.getValue("Value"),
+                    "Numeric cell '3.75' is converted to Float by ordinal-sort CHOICE resolution");
+            assertEquals(3.75f, r2.getValue("Value"));
+
+            // Read past the remaining numeric rows.
+            reader.nextRecord(); // 3.85
+            reader.nextRecord(); // 8
+            reader.nextRecord(); // 2.0
+            reader.nextRecord(); // 4.0
+
+            // Non-numeric cell: FLOAT not compatible, STRING compatible — no IllegalTypeConversionException.
+            // This is the core NIFI-6640 regression guard.
+            final Record r7 = reader.nextRecord();
+            assertInstanceOf(String.class, r7.getValue("Value"),
+                    "Non-numeric cell 'some_string' routes to STRING — no IllegalTypeConversionException");
+            assertEquals("some_string", r7.getValue("Value"));
+
+            assertNull(reader.nextRecord());
         }
     }
 }
