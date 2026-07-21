@@ -20,6 +20,8 @@ import org.apache.commons.io.FileUtils;
 import org.apache.nifi.annotation.lifecycle.OnDisabled;
 import org.apache.nifi.annotation.lifecycle.OnEnabled;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
+import org.apache.nifi.annotation.lifecycle.OnStopped;
+import org.apache.nifi.annotation.lifecycle.OnUnscheduled;
 import org.apache.nifi.bundle.Bundle;
 import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -27,6 +29,7 @@ import org.apache.nifi.components.state.StateManagerProvider;
 import org.apache.nifi.components.validation.ValidationStatus;
 import org.apache.nifi.components.validation.ValidationTrigger;
 import org.apache.nifi.components.validation.VerifiableComponentFactory;
+import org.apache.nifi.connectable.Connectable;
 import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.controller.ConfigurationContext;
 import org.apache.nifi.controller.ExtensionBuilder;
@@ -99,6 +102,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -806,6 +810,181 @@ public class TestStandardProcessScheduler {
         harness.scheduler().shutdown();
     }
 
+    /**
+     * Reproduces the production race in which {@code StandardFlowService#offload()} calls
+     * {@code stopProcessing()} and then, with no wait whatsoever, filters processors by
+     * {@code getScheduledState() == ScheduledState.STOPPED} and calls {@code terminateProcessor()} on every
+     * match. {@code ProcessorNode#getScheduledState()} intentionally maps the transient physical
+     * {@code STOPPING} state to {@code STOPPED} for backward compatibility, so a Processor whose
+     * {@code @OnUnscheduled}/{@code @OnStopped} lifecycle methods are still running satisfies that filter
+     * immediately.
+     *
+     * <p>This variant covers the case where {@code terminateProcessor()} runs <em>after</em> the stop
+     * background thread has already reached {@code activateThread()} (i.e. it is already executing
+     * {@code @OnUnscheduled} and is therefore tracked in {@code StandardProcessorNode.activeThreads}). In
+     * this window, {@code terminate()} finds and interrupts that thread -- mirroring the sibling Kinesis
+     * processors in the incident (e.g. {@code dc633c02}) that logged "Terminated 1 threads" and "Failed to
+     * shutdown Kinesis Scheduler gracefully" as a direct result of being interrupted mid-{@code onTrigger}/
+     * lifecycle-method, and which subsequently did shut down. See
+     * {@link #testTerminateProcessorOrphansStopThreadBeforeItIsTrackedAsActive()} for the *other* window --
+     * the one actually responsible for the permanently orphaned KCL Scheduler ("Terminated 0 threads").
+     */
+    @Test
+    @Timeout(30)
+    public void testTerminateProcessorInterruptsStopThreadAlreadyExecutingOnUnscheduled() throws Exception {
+        final TerminationTestHarness harness = createTerminationTestHarness();
+        final InfiniteOnUnscheduledProcessor processor = new InfiniteOnUnscheduledProcessor();
+        final ProcessorNode procNode = createProcessorNode(harness, processor);
+
+        final LifecycleState lifecycleState = harness.lifecycleStateManager().getOrRegisterLifecycleState(procNode.getIdentifier(), false, false);
+        lifecycleState.setScheduled(true);
+
+        // The stop sequence requires the Processor to be in RUNNING; reflectively force it there since this
+        // test does not run a real scheduling agent.
+        forceScheduledState(procNode, ScheduledState.RUNNING);
+
+        // Mirrors the per-processor call that StandardFlowService#offload()'s stopProcessing() ultimately makes.
+        final CompletableFuture<Void> stopFuture = harness.scheduler().stopProcessor(procNode, ProcessorStopLifecycleMethods.TRIGGER_ALL);
+
+        // Deterministically wait until the background stop thread has actually entered the (infinitely
+        // blocking) @OnUnscheduled method -- at this point activateThread() has already run, so this
+        // thread IS tracked in StandardProcessorNode.activeThreads.
+        assertTrue(processor.onUnscheduledEntered.await(5, TimeUnit.SECONDS), "@OnUnscheduled was never invoked");
+
+        // The stop lifecycle has NOT completed: its Future is still pending, and the Processor's real
+        // physical state is still STOPPING.
+        assertFalse(stopFuture.isDone(), "stop() Future completed even though @OnUnscheduled is still blocked");
+        assertEquals(ScheduledState.STOPPING, procNode.getPhysicalScheduledState());
+
+        // Yet getScheduledState() -- exactly what offload()'s filter checks -- already reports STOPPED,
+        // due to the intentional STOPPING -> STOPPED backward-compatibility mapping.
+        assertEquals(ScheduledState.STOPPED, procNode.getScheduledState(),
+            "getScheduledState() should report STOPPED while still physically STOPPING, satisfying offload's filter prematurely");
+
+        // Reproduce offload()'s very next statement: terminate any processor whose getScheduledState() == STOPPED.
+        // This must succeed (not throw) even though the stop lifecycle is still in flight.
+        harness.scheduler().terminateProcessor(procNode);
+
+        // The framework considers termination "successful" ...
+        assertTrue(lifecycleState.isTerminated());
+
+        // ... and, because the background thread was already tracked in activeThreads when terminate() ran,
+        // it IS interrupted (unlike the "0 threads" orphan case) -- proving termination reaches into an
+        // in-progress @OnUnscheduled invocation rather than waiting for it to finish on its own.
+        assertTrue(processor.onUnscheduledInterrupted.await(5, TimeUnit.SECONDS),
+            "terminate() should have interrupted the in-progress @OnUnscheduled invocation");
+        assertFalse(processor.onUnscheduledReturned, "onUnscheduled() must not have returned normally");
+
+        // Once LifecycleState.terminate() has run, activeThreadCount is permanently pinned to 0, so the stop
+        // background thread's "allThreadsComplete" check (activeThreadCount == 1) can never again succeed;
+        // it always falls into the isTerminated() branch instead, which completes the stop action WITHOUT
+        // ever calling triggerOnStopped(). Poll for a bounded window to confirm @OnStopped is never invoked
+        // (there is no positive completion signal to wait on for a "never happens" assertion).
+        final long deadline = System.currentTimeMillis() + 500L;
+        while (System.currentTimeMillis() < deadline) {
+            assertFalse(processor.onStoppedInvoked, "@OnStopped must never be invoked once the processor has been terminated");
+            Thread.sleep(20L);
+        }
+
+        harness.scheduler().shutdown();
+    }
+
+    /**
+     * Reproduces the exact production symptom for the ConsumeKinesis "spins" processor ({@code eed1498a}):
+     * {@code terminateProcessor()} runs and logs "Terminated 0 threads" / "Successfully terminated with 0
+     * active threads" -- yet the background stop thread runs {@code @OnUnscheduled} without ever being
+     * interrupted by {@code terminate()}, because it had not yet reached {@code activateThread()} (i.e. it
+     * is not yet tracked in {@code StandardProcessorNode.activeThreads}) at the moment {@code terminate()}
+     * ran. In the real incident this is exactly what left the underlying KCL Scheduler background thread
+     * permanently orphaned: nothing was ever left to signal it to shut down.
+     *
+     * <p>{@code StandardProcessorNode.stop()} increments {@link LifecycleState#getActiveThreadCount()}
+     * synchronously (on the calling thread, before the background task is even submitted) but only calls
+     * {@code activateThread()} -- which populates {@code StandardProcessorNode.activeThreads}, the map
+     * {@code terminate()} actually iterates -- once the background thread reaches
+     * {@code triggerLifecycleMethod()}. This test pins that narrow window open deterministically by making
+     * the mocked {@link SchedulingAgent#unschedule} call (invoked by the background thread just before
+     * {@code activateThread()}) block until released, so {@code terminateProcessor()} is guaranteed to run
+     * while {@code activeThreads} is still empty.
+     */
+    @Test
+    @Timeout(30)
+    public void testTerminateProcessorOrphansStopThreadBeforeItIsTrackedAsActive() throws Exception {
+        final TerminationTestHarness harness = createTerminationTestHarness();
+        final LifecycleTrackingProcessor processor = new LifecycleTrackingProcessor();
+        final ProcessorNode procNode = createProcessorNode(harness, processor);
+
+        final LifecycleState lifecycleState = harness.lifecycleStateManager().getOrRegisterLifecycleState(procNode.getIdentifier(), false, false);
+        lifecycleState.setScheduled(true);
+
+        forceScheduledState(procNode, ScheduledState.RUNNING);
+
+        final CountDownLatch unscheduleEntered = new CountDownLatch(1);
+        final CountDownLatch releaseUnschedule = new CountDownLatch(1);
+        final AtomicBoolean stopThreadInterrupted = new AtomicBoolean(false);
+
+        final SchedulingAgent schedulingAgent = harness.scheduler().getSchedulingAgent(SchedulingStrategy.TIMER_DRIVEN);
+        Mockito.doAnswer(invocation -> {
+            unscheduleEntered.countDown();
+            try {
+                releaseUnschedule.await();
+            } catch (final InterruptedException e) {
+                stopThreadInterrupted.set(true);
+                Thread.currentThread().interrupt();
+            }
+            return null;
+        }).when(schedulingAgent).unschedule(Mockito.eq((Connectable) procNode), Mockito.any(LifecycleState.class));
+
+        // Mirrors the per-processor call that StandardFlowService#offload()'s stopProcessing() ultimately makes.
+        final CompletableFuture<Void> stopFuture = harness.scheduler().stopProcessor(procNode, ProcessorStopLifecycleMethods.TRIGGER_ALL);
+
+        // Wait until the background stop thread is blocked inside schedulingAgent.unschedule() -- i.e. it has
+        // NOT yet reached activateThread()/triggerOnUnscheduled(), so StandardProcessorNode.activeThreads is
+        // still completely empty, exactly like the moment "Terminated 0 threads" was logged for eed1498a.
+        assertTrue(unscheduleEntered.await(5, TimeUnit.SECONDS), "background stop thread never reached schedulingAgent.unschedule()");
+
+        assertFalse(stopFuture.isDone(), "stop() Future completed even though the background thread is still blocked");
+        assertEquals(ScheduledState.STOPPING, procNode.getPhysicalScheduledState());
+
+        // Yet getScheduledState() -- exactly what offload()'s filter checks -- already reports STOPPED.
+        assertEquals(ScheduledState.STOPPED, procNode.getScheduledState(),
+            "getScheduledState() should report STOPPED while still physically STOPPING, satisfying offload's filter prematurely");
+
+        // Reproduce offload()'s very next statement. activeThreads is empty, so this interrupts 0 threads --
+        // exactly matching the production log lines "Terminated 0 threads" / "Successfully terminated ...
+        // with 0 active threads".
+        harness.scheduler().terminateProcessor(procNode);
+
+        assertTrue(lifecycleState.isTerminated(), "framework must consider termination successful");
+
+        // Give the still-blocked background thread a brief moment to notice any interrupt, then prove it was
+        // NOT interrupted by terminate() -- it is genuinely orphaned, exactly like the ConsumeKinesis KCL
+        // Scheduler background thread that outlived NiFi's "has completely stopped" declaration in production.
+        Thread.sleep(200);
+        assertFalse(stopThreadInterrupted.get(),
+            "the stop-background-thread should be orphaned (left un-interrupted) by terminate(), matching the " +
+            "'Terminated 0 threads' pattern observed in production");
+
+        // Cleanup: release the blocked thread so it doesn't leak past the test.
+        releaseUnschedule.countDown();
+
+        // The released background thread proceeds to (unconditionally) invoke @OnUnscheduled, then checks
+        // allThreadsComplete (activeThreadCount == 1). Because LifecycleState.terminate() already pinned
+        // activeThreadCount to 0, that check can never succeed, so it falls into the isTerminated() branch
+        // and completes the stop action WITHOUT ever calling triggerOnStopped(). Wait for the one real
+        // synchronization point (@OnUnscheduled completing) then poll a bounded window to confirm @OnStopped
+        // is never invoked -- exactly matching the eed1498a incident, where nothing was left to signal the
+        // orphaned KCL Scheduler to shut down, not even via @OnStopped.
+        assertTrue(processor.onUnscheduledCompleted.await(5, TimeUnit.SECONDS), "@OnUnscheduled was never invoked after release");
+        final long deadline = System.currentTimeMillis() + 500L;
+        while (System.currentTimeMillis() < deadline) {
+            assertFalse(processor.onStoppedInvoked, "@OnStopped must never be invoked once the processor has been terminated");
+            Thread.sleep(20L);
+        }
+
+        harness.scheduler().shutdown();
+    }
+
     private TerminationTestHarness createTerminationTestHarness() {
         final FlowController flowController = Mockito.mock(FlowController.class);
         when(flowController.getExtensionManager()).thenReturn(extensionManager);
@@ -823,8 +1002,11 @@ public class TestStandardProcessScheduler {
     }
 
     private ProcessorNode createSimpleProcessorNode(final TerminationTestHarness harness) {
+        return createProcessorNode(harness, new NoOpProcessor());
+    }
+
+    private ProcessorNode createProcessorNode(final TerminationTestHarness harness, final Processor processor) {
         final String uuid = UUID.randomUUID().toString();
-        final Processor processor = new NoOpProcessor();
         processor.initialize(new StandardProcessorInitializationContext(uuid, null, null, null, KerberosConfig.NOT_CONFIGURED));
 
         final TerminationAwareLogger logger = Mockito.mock(TerminationAwareLogger.class);
@@ -847,6 +1029,82 @@ public class TestStandardProcessScheduler {
     public static class NoOpProcessor extends AbstractProcessor {
         @Override
         public void onTrigger(final ProcessContext context, final ProcessSession session) {
+        }
+    }
+
+    /**
+     * A Processor whose {@code @OnUnscheduled} method blocks indefinitely until explicitly released,
+     * simulating a component whose stop lifecycle (analogous to a KCL {@code Scheduler.startGracefulShutdown()}
+     * call) never gets a chance to complete before the framework moves on. Used to reproduce the race in which
+     * {@code StandardFlowService#offload()} calls {@code terminateProcessor()} immediately after
+     * {@code stopProcessing()}, without waiting for the stop lifecycle to actually finish.
+     *
+     * <p>{@code onUnscheduledInterrupted} is counted down only if the blocking {@code await()} call is
+     * actually interrupted (i.e. {@code terminate()} reached and interrupted this thread), which is caught
+     * here explicitly since NiFi's {@code ReflectionUtils.quietlyInvokeMethodsWithAnnotation} otherwise
+     * swallows the exception silently, making interruption unobservable from the outside.
+     *
+     * <p>{@code onStoppedInvoked} tracks whether {@code @OnStopped} was ever invoked. Once
+     * {@code LifecycleState.terminate()} has run, {@code activeThreadCount} is permanently pinned to 0, so
+     * {@code StandardProcessorNode.stop()}'s background runnable can never again see
+     * {@code activeThreadCount == 1} ("all threads complete") and instead always takes the
+     * {@code isTerminated()} branch, which completes the stop action WITHOUT ever calling
+     * {@code triggerOnStopped()} -- meaning {@code @OnStopped} is skipped entirely, permanently, not merely
+     * delayed.
+     */
+    public static class InfiniteOnUnscheduledProcessor extends AbstractProcessor {
+        final CountDownLatch onUnscheduledEntered = new CountDownLatch(1);
+        final CountDownLatch releaseLatch = new CountDownLatch(1);
+        final CountDownLatch onUnscheduledInterrupted = new CountDownLatch(1);
+        volatile boolean onUnscheduledReturned = false;
+        volatile boolean onStoppedInvoked = false;
+
+        @Override
+        public void onTrigger(final ProcessContext context, final ProcessSession session) {
+        }
+
+        @OnUnscheduled
+        public void onUnscheduled() {
+            onUnscheduledEntered.countDown();
+            try {
+                // Blocks until either the test releases it, or terminate() interrupts this thread.
+                releaseLatch.await();
+                onUnscheduledReturned = true;
+            } catch (final InterruptedException e) {
+                onUnscheduledInterrupted.countDown();
+            }
+        }
+
+        @OnStopped
+        public void onStopped() {
+            onStoppedInvoked = true;
+        }
+    }
+
+    /**
+     * A Processor with non-blocking {@code @OnUnscheduled} and {@code @OnStopped} methods, used to verify
+     * whether {@code @OnStopped} is invoked once {@code StandardProcessorNode.stop()}'s background runnable
+     * resumes after being released. {@code onUnscheduledCompleted} is a reliable, non-racy synchronization
+     * point: since nothing else blocks between {@code triggerOnUnscheduled()} returning and the
+     * {@code allThreadsComplete}/{@code isTerminated()} decision being made on the very same thread, waiting
+     * for it lets tests deterministically settle before asserting on {@code onStoppedInvoked}.
+     */
+    public static class LifecycleTrackingProcessor extends AbstractProcessor {
+        final CountDownLatch onUnscheduledCompleted = new CountDownLatch(1);
+        volatile boolean onStoppedInvoked = false;
+
+        @Override
+        public void onTrigger(final ProcessContext context, final ProcessSession session) {
+        }
+
+        @OnUnscheduled
+        public void onUnscheduled() {
+            onUnscheduledCompleted.countDown();
+        }
+
+        @OnStopped
+        public void onStopped() {
+            onStoppedInvoked = true;
         }
     }
 
