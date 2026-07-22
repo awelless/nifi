@@ -20,6 +20,7 @@ import org.apache.commons.io.FileUtils;
 import org.apache.nifi.annotation.lifecycle.OnDisabled;
 import org.apache.nifi.annotation.lifecycle.OnEnabled;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
+import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.bundle.Bundle;
 import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -27,6 +28,7 @@ import org.apache.nifi.components.state.StateManagerProvider;
 import org.apache.nifi.components.validation.ValidationStatus;
 import org.apache.nifi.components.validation.ValidationTrigger;
 import org.apache.nifi.components.validation.VerifiableComponentFactory;
+import org.apache.nifi.connectable.Connectable;
 import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.controller.ConfigurationContext;
 import org.apache.nifi.controller.ExtensionBuilder;
@@ -99,6 +101,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -806,6 +809,95 @@ public class TestStandardProcessScheduler {
         harness.scheduler().shutdown();
     }
 
+    /**
+     * Reproduces a defect in which {@code @OnStopped} is skipped on a Processor whose stop lifecycle is
+     * preempted by {@link StandardProcessScheduler#terminateProcessor(ProcessorNode)}, mirroring the
+     * sequence in {@code StandardFlowService#offload()}: {@code stopProcessing()} is invoked and its
+     * Future is not awaited before filtering processors by {@code getScheduledState() == ScheduledState.STOPPED}
+     * and calling {@code terminateProcessor()}. Because {@code getScheduledState()} maps the transient
+     * physical {@code STOPPING} state to {@code STOPPED}, {@code terminateProcessor()} can run while the
+     * background stop thread has not even reached {@code schedulingAgent.unschedule()} yet.
+     *
+     * <p>{@link LifecycleState#terminate()} pins {@code activeThreadCount} to {@code 0} permanently. Per
+     * the fix in NIFI-15885 (see {@link #testStopBackgroundPollLoopExitsAfterLifecycleStateTerminated()}),
+     * the stop background runnable now exits cleanly via the {@code lifecycleState.isTerminated()} branch
+     * instead of rescheduling itself forever -- but that branch, like the "all threads complete" branch it
+     * replaces, never invokes {@code @OnStopped}. So {@code @OnStopped} is skipped permanently, not merely
+     * delayed, even after that fix.
+     *
+     * <p>This test asserts the desired behavior -- that {@code @OnStopped} still gets invoked -- rather
+     * than the currently observed one, so it FAILS until the underlying race is fixed.
+     */
+    @Test
+    @Timeout(30)
+    public void testOffloadTerminateRaceSkipsOnStoppedPermanently() throws Exception {
+        final TerminationTestHarness harness = createTerminationTestHarness();
+        final TrackOnStoppedProcessor processor = new TrackOnStoppedProcessor();
+        final ProcessorNode procNode = createProcessorNode(harness, processor);
+
+        final LifecycleState lifecycleState = harness.lifecycleStateManager().getOrRegisterLifecycleState(procNode.getIdentifier(), false, false);
+        lifecycleState.setScheduled(true);
+
+        // The stop sequence requires the Processor to be in RUNNING; reflectively force it there since this
+        // test does not run a real scheduling agent.
+        forceScheduledState(procNode, ScheduledState.RUNNING);
+
+        // Block the background stop thread for a long time right where StandardProcessorNode.stop()'s
+        // runnable calls schedulingAgent.unschedule(StandardProcessorNode.this, lifecycleState) -- i.e.
+        // BEFORE it reaches activateThread()/triggerOnUnscheduled(). No @OnUnscheduled method is needed on
+        // the Processor itself (many real Processors don't have one); the delay is injected at the
+        // scheduling-agent call. The mocked SchedulingAgent otherwise no-ops, so also perform the real
+        // AbstractSchedulingAgent#unschedule() side effect (setScheduled(false)) once the sleep elapses, to
+        // keep the reproduction faithful.
+        final CountDownLatch unscheduleEntered = new CountDownLatch(1);
+        final long unscheduleBlockMillis = 2000L;
+        final SchedulingAgent schedulingAgent = harness.scheduler().getSchedulingAgent(SchedulingStrategy.TIMER_DRIVEN);
+        Mockito.doAnswer(invocation -> {
+            unscheduleEntered.countDown();
+            Thread.sleep(unscheduleBlockMillis);
+            final LifecycleState ls = invocation.getArgument(1);
+            ls.setScheduled(false);
+            return null;
+        }).when(schedulingAgent).unschedule(Mockito.eq((Connectable) procNode), Mockito.any(LifecycleState.class));
+
+        // Mirrors StandardFlowService#offload(): stopProcessing() is called and its Future is never awaited.
+        final CompletableFuture<Void> stopFuture = harness.scheduler().stopProcessor(procNode, ProcessorStopLifecycleMethods.TRIGGER_ALL);
+
+        assertTrue(unscheduleEntered.await(5, TimeUnit.SECONDS), "background stop thread never called schedulingAgent.unschedule()");
+        assertFalse(stopFuture.isDone(), "stop() Future completed even though the background thread is still blocked");
+        assertEquals(ScheduledState.STOPPING, procNode.getPhysicalScheduledState());
+
+        // Exactly what offload()'s filter checks: getScheduledState() already reports STOPPED, even though
+        // the Processor is still physically STOPPING and its stop lifecycle has not run at all yet.
+        assertEquals(ScheduledState.STOPPED, procNode.getScheduledState(),
+            "getScheduledState() should report STOPPED while still physically STOPPING, satisfying offload()'s filter prematurely");
+
+        // Reproduce offload()'s very next statement: terminate any processor whose getScheduledState() == STOPPED.
+        harness.scheduler().terminateProcessor(procNode);
+
+        // The framework now considers the Processor completely stopped...
+        assertTrue(stopFuture.isDone(), "terminateProcessor() should have completed the original stop Future");
+
+        // ...but because of the defect this test reproduces, @OnStopped never actually fires: once the
+        // background runnable wakes up from the blocked unschedule() call, it observes
+        // LifecycleState.isTerminated() and exits cleanly (per the NIFI-15885 fix) without ever reaching
+        // the branch that triggers @OnStopped. Poll for it anyway -- there is no positive completion
+        // signal to react to synchronously -- so the assertion below fails once the deadline elapses
+        // rather than hanging until the @Timeout.
+        final long deadline = System.currentTimeMillis() + (2 * unscheduleBlockMillis);
+        boolean onStoppedInvoked = false;
+        while (System.currentTimeMillis() < deadline) {
+            if (processor.onStoppedInvoked.get()) {
+                onStoppedInvoked = true;
+                break;
+            }
+            Thread.sleep(50L);
+        }
+        harness.scheduler().shutdown();
+
+        assertTrue(onStoppedInvoked, "@OnStopped was never invoked");
+    }
+
     private TerminationTestHarness createTerminationTestHarness() {
         final FlowController flowController = Mockito.mock(FlowController.class);
         when(flowController.getExtensionManager()).thenReturn(extensionManager);
@@ -823,8 +915,11 @@ public class TestStandardProcessScheduler {
     }
 
     private ProcessorNode createSimpleProcessorNode(final TerminationTestHarness harness) {
+        return createProcessorNode(harness, new NoOpProcessor());
+    }
+
+    private ProcessorNode createProcessorNode(final TerminationTestHarness harness, final Processor processor) {
         final String uuid = UUID.randomUUID().toString();
-        final Processor processor = new NoOpProcessor();
         processor.initialize(new StandardProcessorInitializationContext(uuid, null, null, null, KerberosConfig.NOT_CONFIGURED));
 
         final TerminationAwareLogger logger = Mockito.mock(TerminationAwareLogger.class);
@@ -847,6 +942,23 @@ public class TestStandardProcessScheduler {
     public static class NoOpProcessor extends AbstractProcessor {
         @Override
         public void onTrigger(final ProcessContext context, final ProcessSession session) {
+        }
+    }
+
+    /**
+     * A Processor with no {@code @OnUnscheduled} method (deliberately, to mirror Processors that don't
+     * define one) and an {@code @OnStopped} method that simply records whether it was ever invoked.
+     */
+    public static class TrackOnStoppedProcessor extends AbstractProcessor {
+        final AtomicBoolean onStoppedInvoked = new AtomicBoolean(false);
+
+        @Override
+        public void onTrigger(final ProcessContext context, final ProcessSession session) {
+        }
+
+        @OnStopped
+        public void onStopped() {
+            onStoppedInvoked.set(true);
         }
     }
 
