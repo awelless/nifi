@@ -18,6 +18,7 @@ package org.apache.nifi.kafka.processors.consumer.convert;
 
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.kafka.processors.consumer.OffsetTracker;
+import org.apache.nifi.kafka.processors.consumer.transform.UseValueRecordTransform;
 import org.apache.nifi.kafka.service.api.record.ByteRecord;
 import org.apache.nifi.kafka.shared.attribute.KafkaFlowFileAttribute;
 import org.apache.nifi.kafka.shared.property.KeyEncoding;
@@ -57,7 +58,7 @@ class RecordStreamKafkaMessageConverterTest {
     private final OffsetTracker offsetTracker = new OffsetTracker();
 
     @Test
-    void testGroupingOfMessagesByTopicAndPartition() {
+    void testGroupingOfMessagesByTopicAndPartition() throws Exception {
         // Initialize MockRecordParser
         final MockRecordParser readerFactory = new MockRecordParser();
         readerFactory.addSchemaField("field1", RecordFieldType.STRING);
@@ -78,7 +79,8 @@ class RecordStreamKafkaMessageConverterTest {
                 true,
                 offsetTracker,
                 logger,
-                "brokerUri"
+                "brokerUri",
+                new UseValueRecordTransform(value -> new String(value, StandardCharsets.UTF_8), Pattern.compile(".*"))
         );
 
         // Create ByteRecords
@@ -97,6 +99,7 @@ class RecordStreamKafkaMessageConverterTest {
         final FlowFile flowFile4 = new MockFlowFile(4);
         when(session.create()).thenReturn(flowFile1, flowFile2, flowFile3, flowFile4);
         when(session.write(any(FlowFile.class))).thenReturn(mock(OutputStream.class));
+        when(writerFactory.getSchema(any(), any())).thenAnswer(invocation -> invocation.getArgument(1));
 
         // Call the method under test
         converter.toFlowFiles(session, consumerRecords);
@@ -106,21 +109,24 @@ class RecordStreamKafkaMessageConverterTest {
         verify(session, atLeastOnce()).putAllAttributes(any(FlowFile.class), attributesCaptor.capture());
 
         final List<Map<String, String>> capturedAttributes = attributesCaptor.getAllValues();
+        final List<Map<String, String>> createdGroupAttributes = capturedAttributes.stream()
+                .filter(attrs -> attrs.containsKey(KafkaFlowFileAttribute.KAFKA_TOPIC)
+                        && attrs.containsKey(KafkaFlowFileAttribute.KAFKA_PARTITION)
+                        && attrs.size() == 2)
+                .toList();
+        assertEquals(3, createdGroupAttributes.size());
 
         // check group1 records
-        assertEquals("topic1", capturedAttributes.get(0).get(KafkaFlowFileAttribute.KAFKA_TOPIC));
-        assertEquals("0", capturedAttributes.get(0).get(KafkaFlowFileAttribute.KAFKA_PARTITION));
-
-        assertEquals("topic1", capturedAttributes.get(3).get(KafkaFlowFileAttribute.KAFKA_TOPIC));
-        assertEquals("0", capturedAttributes.get(3).get(KafkaFlowFileAttribute.KAFKA_PARTITION));
+        assertEquals("topic1", createdGroupAttributes.get(0).get(KafkaFlowFileAttribute.KAFKA_TOPIC));
+        assertEquals("0", createdGroupAttributes.get(0).get(KafkaFlowFileAttribute.KAFKA_PARTITION));
 
         //check group2 records
-        assertEquals("topic1", capturedAttributes.get(1).get(KafkaFlowFileAttribute.KAFKA_TOPIC));
-        assertEquals("1", capturedAttributes.get(1).get(KafkaFlowFileAttribute.KAFKA_PARTITION));
+        assertEquals("topic1", createdGroupAttributes.get(1).get(KafkaFlowFileAttribute.KAFKA_TOPIC));
+        assertEquals("1", createdGroupAttributes.get(1).get(KafkaFlowFileAttribute.KAFKA_PARTITION));
 
         //check group3 records
-        assertEquals("topic2", capturedAttributes.get(2).get(KafkaFlowFileAttribute.KAFKA_TOPIC));
-        assertEquals("0", capturedAttributes.get(2).get(KafkaFlowFileAttribute.KAFKA_PARTITION));
+        assertEquals("topic2", createdGroupAttributes.get(2).get(KafkaFlowFileAttribute.KAFKA_TOPIC));
+        assertEquals("0", createdGroupAttributes.get(2).get(KafkaFlowFileAttribute.KAFKA_PARTITION));
 
         final List<String> timestamps = capturedAttributes.stream()
                 .map(attrs -> attrs.get(KafkaFlowFileAttribute.KAFKA_TIMESTAMP))
