@@ -39,9 +39,11 @@ import org.apache.nifi.kafka.processors.common.KafkaUtils;
 import org.apache.nifi.kafka.processors.consumer.OffsetTracker;
 import org.apache.nifi.kafka.processors.consumer.ProcessingStrategy;
 import org.apache.nifi.kafka.processors.consumer.bundle.ByteRecordBundler;
+import org.apache.nifi.kafka.processors.consumer.convert.CreateNewFlowFileGrouping;
 import org.apache.nifi.kafka.processors.consumer.convert.FlowFileStreamKafkaMessageConverter;
 import org.apache.nifi.kafka.processors.consumer.convert.InjectOffsetRecordStreamKafkaMessageConverter;
 import org.apache.nifi.kafka.processors.consumer.convert.KafkaMessageConverter;
+import org.apache.nifi.kafka.processors.consumer.convert.RecordGroupingStrategy;
 import org.apache.nifi.kafka.processors.consumer.convert.RecordStreamKafkaMessageConverter;
 import org.apache.nifi.kafka.processors.consumer.convert.WrapperRecordStreamKafkaMessageConverter;
 import org.apache.nifi.kafka.service.api.KafkaConnectionService;
@@ -867,10 +869,12 @@ public class ConsumeKafka extends AbstractProcessor implements VerifiableProcess
         final RecordReaderFactory readerFactory = context.getProperty(RECORD_READER).asControllerService(RecordReaderFactory.class);
         final RecordSetWriterFactory writerFactory = context.getProperty(RECORD_WRITER).asControllerService(RecordSetWriterFactory.class);
 
+        final RecordGroupingStrategy recordGroupingStrategy = new CreateNewFlowFileGrouping(writerFactory, getLogger(), brokerUri, commitOffsets);
+
         final KafkaMessageConverter converter;
         if (outputStrategy == OutputStrategy.USE_VALUE) {
             converter = new RecordStreamKafkaMessageConverter(readerFactory, writerFactory, headerValueConverter, headerNamePattern,
-                    keyEncoding, commitOffsets, offsetTracker, getLogger(), brokerUri);
+                    keyEncoding, commitOffsets, offsetTracker, getLogger(), brokerUri, recordGroupingStrategy);
         } else if (outputStrategy == OutputStrategy.INJECT_OFFSET) {
             converter = new InjectOffsetRecordStreamKafkaMessageConverter(
                     readerFactory,
@@ -881,14 +885,16 @@ public class ConsumeKafka extends AbstractProcessor implements VerifiableProcess
                     commitOffsets,
                     offsetTracker,
                     getLogger(),
-                    brokerUri
+                    brokerUri,
+                    recordGroupingStrategy
             );
         } else {
             final RecordReaderFactory keyReaderFactory = keyFormat == KeyFormat.RECORD
                 ? context.getProperty(KEY_RECORD_READER).asControllerService(RecordReaderFactory.class) : null;
 
             converter = new WrapperRecordStreamKafkaMessageConverter(readerFactory, writerFactory, keyReaderFactory,
-                headerValueConverter, headerNamePattern, keyFormat, keyEncoding, commitOffsets, offsetTracker, getLogger(), brokerUri, outputStrategy);
+                headerValueConverter, headerNamePattern, keyFormat, keyEncoding, commitOffsets, offsetTracker, getLogger(), brokerUri, outputStrategy,
+                recordGroupingStrategy);
         }
 
         converter.toFlowFiles(session, consumerRecords);
