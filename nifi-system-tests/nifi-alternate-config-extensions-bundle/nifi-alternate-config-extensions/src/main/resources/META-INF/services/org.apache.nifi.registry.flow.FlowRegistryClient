@@ -13,5 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-org.apache.nifi.cs.tests.system.MigrationService
-org.apache.nifi.cs.tests.system.FileBackedStoreService
+org.apache.nifi.flow.registry.FileSystemFlowRegistryClient
