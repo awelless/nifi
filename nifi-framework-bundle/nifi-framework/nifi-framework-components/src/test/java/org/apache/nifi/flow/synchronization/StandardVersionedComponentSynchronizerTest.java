@@ -67,6 +67,7 @@ import org.apache.nifi.groups.ProcessGroup;
 import org.apache.nifi.groups.ScheduledStateChangeListener;
 import org.apache.nifi.groups.VersionedComponentAdditions;
 import org.apache.nifi.logging.LogLevel;
+import org.apache.nifi.migration.StandardControllerServiceFactory;
 import org.apache.nifi.nar.ExtensionManager;
 import org.apache.nifi.parameter.Parameter;
 import org.apache.nifi.parameter.ParameterContext;
@@ -513,6 +514,104 @@ public class StandardVersionedComponentSynchronizerTest {
         verify(processorNode).migrateConfiguration(propertiesCaptor.capture(), any());
         final Map<String, String> migratedProperties = propertiesCaptor.getValue();
         assertEquals(controllerServiceNode.getIdentifier(), migratedProperties.get("cs"));
+    }
+
+    /**
+     * A Controller Service created by property migration is absent from any flow version published before the migration existed,
+     * so synchronizing against such a version must leave it in place.
+     */
+    @Test
+    public void testMigrationCreatedControllerServiceNotRemovedWhenAbsentFromProposedFlow() {
+        final ControllerServiceNode serviceNode = synchronizeWithLocalOnlyControllerService(
+                StandardControllerServiceFactory.MIGRATION_CREATED_COMMENT, Collections.emptySet(), null);
+
+        verify(controllerServiceProvider, never()).removeControllerService(serviceNode);
+    }
+
+    /**
+     * A flow version that declares a Controller Service of its own does not describe the one property migration created.
+     * The published version is authored on another instance, so its identifier cannot match the deterministic identifier
+     * the local migration produced. The migration-created service must survive the synchronization regardless, because
+     * removing it discards the state it holds. What becomes of the service the proposed flow declares is a separate
+     * question that this test does not pin down.
+     */
+    @Test
+    public void testMigrationCreatedControllerServiceNotRemovedWhenProposedFlowDeclaresAnotherService() {
+        final ControllerServiceNode serviceNode = synchronizeWithLocalOnlyControllerService(
+                StandardControllerServiceFactory.MIGRATION_CREATED_COMMENT, Set.of(createMinimalVersionedControllerService()), null);
+
+        verify(controllerServiceProvider, never()).removeControllerService(serviceNode);
+    }
+
+    /**
+     * Since version id is deterministic, when we set it to expected value in versioned flow, the component must be found.
+     * Controller service id created by migration is also deterministic.
+     */
+    @Test
+    public void testMigrationCreatedControllerServiceNotRemovedWhenVersionedIdIsSpecificForTheControllerServiceId() {
+        final String id = "21673905-850f-4b58-b4f4-42134f3c0b65";
+        final String versionedId = VersionedComponentFlowMapper.generateVersionedComponentId(id);
+
+        final VersionedControllerService proposedService = createMinimalVersionedControllerService();
+        proposedService.setIdentifier(versionedId);
+
+        final ControllerServiceNode serviceNode = synchronizeWithLocalOnlyControllerService(
+                StandardControllerServiceFactory.MIGRATION_CREATED_COMMENT, Set.of(proposedService), id);
+
+        verify(controllerServiceProvider, never()).removeControllerService(serviceNode);
+    }
+
+    /**
+     * A Controller Service that a user added is not protected by the migration marker and is still removed when the proposed flow does not declare it.
+     * This is the counterpart to the migration-created case.
+     */
+    @Test
+    public void testUserAddedControllerServiceRemovedWhenAbsentFromProposedFlow() {
+        final ControllerServiceNode serviceNode = synchronizeWithLocalOnlyControllerService("Added by a user", Collections.emptySet(), null);
+        verify(controllerServiceProvider).removeControllerService(serviceNode);
+    }
+
+    /**
+     * Synchronizes a Process Group that holds a single Controller Service with the given comments against a proposed flow that
+     * declares the given Controller Services and no other components, and returns the local service so that the caller can assert
+     * on its removal. The local service is DISABLED and has no versioned component id, matching a service that exists only in the
+     * running flow, so it never matches anything the proposed flow declares.
+     */
+    private ControllerServiceNode synchronizeWithLocalOnlyControllerService(final String comments, final Set<VersionedControllerService> proposedServices, final String hardcodedId) {
+        final ProcessGroup processGroup = createMockProcessGroup();
+
+        // Configure the local service to match createMinimalVersionedControllerService in every respect a flow definition
+        // records, so that the comments are the only attribute telling a migration-created service apart from one a user
+        // added. The identifier necessarily differs, because a published flow is authored on a different instance.
+        final VersionedControllerService equivalentService = createMinimalVersionedControllerService();
+
+        final PropertyDescriptor descriptor = new PropertyDescriptor.Builder().name("abc").build();
+
+        final ControllerServiceNode serviceNode = createMockControllerService();
+        if (hardcodedId != null) {
+            when(serviceNode.getIdentifier()).thenReturn(hardcodedId);
+        }
+        when(serviceNode.getComments()).thenReturn(comments);
+        when(serviceNode.getName()).thenReturn(equivalentService.getName());
+        when(serviceNode.getCanonicalClassName()).thenReturn(equivalentService.getType());
+        when(serviceNode.getBundleCoordinate()).thenReturn(bundleCoordinate);
+        when(serviceNode.getProperties()).thenReturn(Map.of(descriptor, new PropertyConfiguration("123", null, null, null)));
+        when(serviceNode.getRawPropertyValues()).thenReturn(Map.of(descriptor, "123"));
+        when(serviceNode.getVersionedComponentId()).thenReturn(Optional.empty());
+        when(serviceNode.getState()).thenReturn(ControllerServiceState.DISABLED);
+        when(processGroup.getControllerServices(false)).thenReturn(Set.of(serviceNode));
+
+        final VersionedProcessGroup versionedGroup = new VersionedProcessGroup();
+        versionedGroup.setIdentifier("pg-v2");
+        versionedGroup.setControllerServices(proposedServices);
+        versionedGroup.setProcessors(Collections.emptySet());
+
+        final VersionedExternalFlow externalFlow = new VersionedExternalFlow();
+        externalFlow.setFlowContents(versionedGroup);
+
+        synchronizer.synchronize(processGroup, externalFlow, synchronizationOptions);
+
+        return serviceNode;
     }
 
     @Test

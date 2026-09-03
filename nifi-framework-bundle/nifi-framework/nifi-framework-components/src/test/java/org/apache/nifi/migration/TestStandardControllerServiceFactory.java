@@ -21,7 +21,9 @@ import org.apache.nifi.bundle.Bundle;
 import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.bundle.BundleDetails;
 import org.apache.nifi.controller.ComponentNode;
+import org.apache.nifi.controller.ControllerService;
 import org.apache.nifi.controller.flow.FlowManager;
+import org.apache.nifi.controller.service.ControllerServiceNode;
 import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.nar.ExtensionManager;
 import org.junit.jupiter.api.Assertions;
@@ -30,6 +32,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -50,11 +53,12 @@ public class TestStandardControllerServiceFactory {
     private List<Bundle> bundles;
     private ComponentNode creator;
     private ControllerServiceProvider serviceProvider;
+    private FlowManager flowManager;
 
     @BeforeEach
     public void setup() {
         final ExtensionManager extensionManager = mock(ExtensionManager.class);
-        final FlowManager flowManager = mock(FlowManager.class);
+        flowManager = mock(FlowManager.class);
         creator = mock(ComponentNode.class);
 
         bundles = new ArrayList<>();
@@ -140,6 +144,31 @@ public class TestStandardControllerServiceFactory {
 
         // Assert all IDs are unique
         assertEquals(4, Set.of(initialServiceId, secondGroupId, thirdId, fourthId).size());
+    }
+
+    /**
+     * When a Controller Service with the deterministic identifier already exists, property migration reuses it instead of creating a second one.
+     * This is what keeps a runtime restart from duplicating a migration-created service.
+     */
+    @Test
+    public void testExistingServiceReportedAsAlreadyExisting() {
+        final Map<String, String> serviceProperties = Map.of("PropertyA", "ValueA");
+
+        final ControllerService serviceImplementation = mock(ControllerService.class);
+        final String implementationClassName = serviceImplementation.getClass().getName();
+        final String serviceId = factory.determineServiceId(implementationClassName, serviceProperties);
+
+        final ControllerServiceNode existingNode = mock(ControllerServiceNode.class);
+        when(flowManager.getControllerServiceNode(serviceId)).thenReturn(existingNode);
+        when(existingNode.getControllerServiceImplementation()).thenReturn(serviceImplementation);
+        when(existingNode.getIdentifier()).thenReturn(serviceId);
+        when(existingNode.getRawPropertyValues()).thenReturn(Collections.emptyMap());
+        when(existingNode.getBundleCoordinate()).thenReturn(createCoordinate(LONE_BUNDLE, VERSION_2));
+
+        final ControllerServiceCreationDetails details = factory.getCreationDetails(implementationClassName, serviceProperties);
+
+        assertEquals(ControllerServiceCreationDetails.CreationState.SERVICE_ALREADY_EXISTS, details.creationState());
+        assertEquals(serviceId, details.serviceIdentifier());
     }
 
     private BundleCoordinate createCoordinate(final String artifactId, final String version) {
