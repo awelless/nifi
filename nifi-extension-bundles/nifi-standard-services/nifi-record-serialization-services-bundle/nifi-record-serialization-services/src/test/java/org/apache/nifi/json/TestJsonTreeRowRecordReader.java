@@ -19,10 +19,13 @@ package org.apache.nifi.json;
 
 import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.core.exc.StreamConstraintsException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.avro.Schema;
 import org.apache.commons.io.FileUtils;
+import org.apache.nifi.NullSuppression;
 import org.apache.nifi.avro.AvroTypeUtil;
 import org.apache.nifi.logging.ComponentLog;
+import org.apache.nifi.schema.access.SchemaNameAsAttribute;
 import org.apache.nifi.schema.inference.InferSchemaAccessStrategy;
 import org.apache.nifi.schema.inference.TimeValueInference;
 import org.apache.nifi.serialization.MalformedRecordException;
@@ -34,16 +37,21 @@ import org.apache.nifi.serialization.record.RecordField;
 import org.apache.nifi.serialization.record.RecordFieldType;
 import org.apache.nifi.serialization.record.RecordSchema;
 import org.apache.nifi.serialization.record.type.ChoiceDataType;
+import org.apache.nifi.serialization.record.util.DataTypeUtils;
 import org.apache.nifi.util.EqualsWrapper;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -64,6 +72,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -1271,6 +1280,143 @@ class TestJsonTreeRowRecordReader {
 
             assertEquals(expectedCapturedFields, capturedFields);
         }
+    }
+
+    @Test
+    void testNestedArrayRoundTripWithInferredSchema() throws Exception {
+        final String json = """
+                {"attributes":[[[]],[[{"key":"example","value":"sample"}]]],
+                 "identifiers":[["first"],["second"]]}
+                """;
+        final ObjectMapper mapper = new ObjectMapper();
+        try (final InputStream input = new ByteArrayInputStream(json.getBytes(StandardCharsets.UTF_8));
+             final ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            final RecordSchema schema = inferSchema(input, StartingFieldStrategy.ROOT_NODE, null);
+            LOGGER.info("Nested array inferred NiFi schema: {}", schema);
+            try (final JsonTreeRowRecordReader reader = createJsonTreeRowRecordReader(input, schema);
+                 final WriteJsonResult writer = new WriteJsonResult(log, schema, new SchemaNameAsAttribute(), output, false,
+                         NullSuppression.NEVER_SUPPRESS, OutputGrouping.OUTPUT_ONELINE, null, null, null, "application/json", false)) {
+                final Record record = reader.nextRecord();
+                writer.beginRecordSet();
+                writer.write(new MapRecord(schema, record.toMap()));
+                writer.finishRecordSet();
+                writer.flush();
+                assertEquals(mapper.readTree(json), mapper.readTree(output.toString(StandardCharsets.UTF_8)));
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("nestedArrayMergeCases")
+    void testNestedArrayRoundTripAfterMergingEmptyArraySchema(final String emptyArray, final boolean emptyFirst, final String populatedArray) throws Exception {
+        final String populated = "{\"attributes\":" + populatedArray + "}";
+        final ObjectMapper mapper = new ObjectMapper();
+        final String empty = "{\"attributes\":" + emptyArray + "}";
+        try (final InputStream emptyInput = new ByteArrayInputStream(empty.getBytes(StandardCharsets.UTF_8));
+             final InputStream populatedInput = new ByteArrayInputStream(populated.getBytes(StandardCharsets.UTF_8));
+             final ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            final RecordSchema emptySchema = inferSchema(emptyInput, StartingFieldStrategy.ROOT_NODE, null);
+            final RecordSchema populatedSchema = inferSchema(populatedInput, StartingFieldStrategy.ROOT_NODE, null);
+            final RecordSchema merged = emptyFirst ? DataTypeUtils.merge(emptySchema, populatedSchema) : DataTypeUtils.merge(populatedSchema, emptySchema);
+            LOGGER.info("Empty input {}, emptyFirst={}, merged NiFi schema: {}", empty, emptyFirst, merged);
+            try (final JsonTreeRowRecordReader reader = createJsonTreeRowRecordReader(populatedInput, populatedSchema);
+                 final WriteJsonResult writer = new WriteJsonResult(log, merged, new SchemaNameAsAttribute(), output, false,
+                         NullSuppression.NEVER_SUPPRESS, OutputGrouping.OUTPUT_ONELINE, null, null, null, "application/json", false)) {
+                final Record record = reader.nextRecord();
+                writer.beginRecordSet();
+                writer.write(new MapRecord(populatedSchema, record.toMap()));
+                writer.finishRecordSet();
+                writer.flush();
+                final String actual = output.toString(StandardCharsets.UTF_8);
+                LOGGER.info("Merged schema round trip output: {}", actual);
+                assertEquals(mapper.readTree(populated), mapper.readTree(actual), empty);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("nestedArrayVariantCases")
+    void testNestedArrayVariantsWithMergedSchema(final String fieldName, final List<String> values, final boolean reverseOrder) throws Exception {
+        final ObjectMapper mapper = new ObjectMapper();
+        final List<String> orderedValues = new ArrayList<>(values);
+        if (reverseOrder) {
+            Collections.reverse(orderedValues);
+        }
+
+        final List<String> inputs = new ArrayList<>();
+        final List<RecordSchema> schemas = new ArrayList<>();
+        RecordSchema merged = null;
+        for (final String value : orderedValues) {
+            final String input = "{\"" + fieldName + "\":" + value + "}";
+            inputs.add(input);
+            try (final InputStream stream = new ByteArrayInputStream(input.getBytes(StandardCharsets.UTF_8))) {
+                final RecordSchema schema = inferSchema(stream, StartingFieldStrategy.ROOT_NODE, null);
+                schemas.add(schema);
+                merged = DataTypeUtils.merge(merged, schema);
+            }
+        }
+
+        LOGGER.info("Field {}, reverseOrder={}, merged NiFi schema: {}", fieldName, reverseOrder, merged);
+        for (int index = 0; index < inputs.size(); index++) {
+            final String input = inputs.get(index);
+            final RecordSchema schema = schemas.get(index);
+            try (final InputStream stream = new ByteArrayInputStream(input.getBytes(StandardCharsets.UTF_8));
+                 final ByteArrayOutputStream output = new ByteArrayOutputStream();
+                 final JsonTreeRowRecordReader reader = createJsonTreeRowRecordReader(stream, schema);
+                 final WriteJsonResult writer = new WriteJsonResult(log, merged, new SchemaNameAsAttribute(), output, false,
+                         NullSuppression.NEVER_SUPPRESS, OutputGrouping.OUTPUT_ONELINE, null, null, null, "application/json", false)) {
+                final Record record = reader.nextRecord();
+                writer.beginRecordSet();
+                writer.write(new MapRecord(schema, record.toMap()));
+                writer.finishRecordSet();
+                writer.flush();
+                assertEquals(mapper.readTree(input), mapper.readTree(output.toString(StandardCharsets.UTF_8)), input);
+            }
+        }
+    }
+
+    private static Stream<Arguments> nestedArrayVariantCases() {
+        final String eightEmptyBranches = """
+                [[[]],[[]],[[]],[[]],[[]],[[]],[[]],[[]]]
+                """;
+        final String populatedMetadata = """
+                [[[{"key":"example","value":"sample"}]]]
+                """;
+        final String populatedMultimedia = """
+                [[[{"link":"https://example.invalid/1.png","type":"image"},
+                   {"link":"https://example.invalid/2.png","type":"image"},
+                   {"link":"https://example.invalid/3.png","type":"image"},
+                   {"link":"https://example.invalid/4.png","type":"image"}]]]
+                """;
+        final String mixedMultimedia = """
+                [[[]],[[{"link":"https://example.invalid/1.png","type":"image"},
+                        {"link":"https://example.invalid/2.png","type":"image"},
+                        {"link":"https://example.invalid/3.png","type":"image"},
+                        {"link":"https://example.invalid/4.png","type":"image"}]]]
+                """;
+        final List<String> metadataValues = List.of(eightEmptyBranches, populatedMetadata, "[[[]]]", "[[[]],[[]]]");
+        final List<String> multimediaValues = List.of(eightEmptyBranches, populatedMultimedia, mixedMultimedia);
+        return Stream.of(
+                Arguments.of("attributes", metadataValues, false),
+                Arguments.of("attributes", metadataValues, true),
+                Arguments.of("attachments", multimediaValues, false),
+                Arguments.of("attachments", multimediaValues, true));
+    }
+
+    private static Stream<Arguments> nestedArrayMergeCases() {
+        final String populated = """
+                [[[]],[[{"key":"example","value":"sample"}]]]
+                """;
+        final String populatedOnly = """
+                [[[{"key":"example","value":"sample"}]]]
+                """;
+        final Stream<Arguments> depthControls = Stream.of("[]", "[[]]", "[[[]]]")
+                .flatMap(empty -> Stream.of(Arguments.of(empty, true, populated), Arguments.of(empty, false, populated)));
+        final Stream<Arguments> nestedShapes = Stream.of(1, 2, 8)
+                .map(count -> "[" + String.join(",", Collections.nCopies(count, "[[]]")) + "]")
+                .flatMap(empty -> Stream.of(true, false)
+                        .flatMap(emptyFirst -> Stream.of(populated, populatedOnly).map(value -> Arguments.of(empty, emptyFirst, value))));
+        return Stream.concat(depthControls, nestedShapes);
     }
 
     private void testReadRecords(String jsonFilename, List<Object> expected) throws Exception {

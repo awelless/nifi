@@ -26,18 +26,27 @@ import org.apache.nifi.serialization.record.RecordSchema;
 import org.apache.nifi.serialization.record.type.ArrayDataType;
 import org.apache.nifi.serialization.record.type.ChoiceDataType;
 import org.apache.nifi.serialization.record.type.RecordDataType;
+import org.apache.nifi.serialization.record.util.DataTypeUtils;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.Mockito;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -176,6 +185,68 @@ class TestJsonSchemaInference {
 
         final DataType arrayElementType = ((ArrayDataType) arrayDataType).getElementType();
         assertSame(RecordFieldType.STRING, arrayElementType.getFieldType());
+    }
+
+    @ParameterizedTest
+    @MethodSource("nestedArrayInferenceCases")
+    void testNestedEmptyArraysPreserveRecordInference(final int emptyCount, final boolean emptyFirst, final String populatedArray) throws IOException {
+        final String emptyArray = "[" + String.join(",", Collections.nCopies(emptyCount, "[[]]")) + "]";
+        final String emptyRecord = "{\"items\":" + emptyArray + "}";
+        final String populatedRecord = "{\"items\":" + populatedArray + "}";
+        final String records = emptyFirst ? "[" + emptyRecord + "," + populatedRecord + "]" : "[" + populatedRecord + "," + emptyRecord + "]";
+        final JsonSchemaInference inference = new JsonSchemaInference(timestampInference);
+        try (final InputStream input = new ByteArrayInputStream(records.getBytes(StandardCharsets.UTF_8));
+             final InputStream populatedInput = new ByteArrayInputStream(populatedRecord.getBytes(StandardCharsets.UTF_8))) {
+            final RecordSchema expected = inference.inferSchema(new JsonRecordSource(populatedInput));
+            final RecordSchema actual = inference.inferSchema(new JsonRecordSource(input));
+            assertEquals(expected, actual);
+            DataType elementType = actual.getDataType("items").orElseThrow();
+            for (int depth = 0; depth < 3; depth++) {
+                assertSame(RecordFieldType.ARRAY, elementType.getFieldType());
+                elementType = ((ArrayDataType) elementType).getElementType();
+            }
+            assertSame(RecordFieldType.RECORD, elementType.getFieldType());
+        }
+    }
+
+    @Test
+    void testSeparateInferenceDefaultsEmptyArraysBeforeSchemaMerge() throws IOException {
+        final String empty = """
+                {"items":[[[]]]}
+                """;
+        final String populated = """
+                {"items":[[[{"key":"example","value":"sample"}]]]}
+                """;
+        final JsonSchemaInference inference = new JsonSchemaInference(timestampInference);
+        try (final InputStream emptyInput = new ByteArrayInputStream(empty.getBytes(StandardCharsets.UTF_8));
+             final InputStream populatedInput = new ByteArrayInputStream(populated.getBytes(StandardCharsets.UTF_8));
+             final InputStream combinedInput = new ByteArrayInputStream(("[" + empty + "," + populated + "]").getBytes(StandardCharsets.UTF_8))) {
+            final RecordSchema emptySchema = inference.inferSchema(new JsonRecordSource(emptyInput));
+            final RecordSchema populatedSchema = inference.inferSchema(new JsonRecordSource(populatedInput));
+            final RecordSchema combinedSchema = inference.inferSchema(new JsonRecordSource(combinedInput));
+            final DataType emptyType = RecordFieldType.ARRAY.getArrayDataType(RecordFieldType.ARRAY.getArrayDataType(
+                    RecordFieldType.ARRAY.getArrayDataType(RecordFieldType.STRING.getDataType())));
+            assertEquals(emptyType, emptySchema.getDataType("items").orElseThrow());
+            assertEquals(populatedSchema, combinedSchema);
+            final RecordSchema separatelyMerged = DataTypeUtils.merge(emptySchema, populatedSchema);
+            final ChoiceDataType choices = (ChoiceDataType) separatelyMerged.getDataType("items").orElseThrow();
+            assertEquals(List.of(emptyType, populatedSchema.getDataType("items").orElseThrow()), choices.getPossibleSubTypes());
+            assertNotEquals(combinedSchema, separatelyMerged);
+        }
+    }
+
+    private static Stream<Arguments> nestedArrayInferenceCases() {
+        final String metadata = """
+                [[[{"key":"example","value":"sample"}]]]
+                """;
+        final String multimedia = """
+                [[[]],[[{"type":"image","link":"https://example.invalid/1.png"},
+                        {"type":"image","link":"https://example.invalid/2.png"},
+                        {"type":"image","link":"https://example.invalid/3.png"},
+                        {"type":"image","link":"https://example.invalid/4.png"}]]]
+                """;
+        return Stream.of(1, 2, 8).flatMap(count -> Stream.of(true, false)
+                .flatMap(emptyFirst -> Stream.of(metadata, multimedia).map(populated -> Arguments.of(count, emptyFirst, populated))));
     }
 
     private RecordSchema inferSchema(final File jsonFile) throws IOException {

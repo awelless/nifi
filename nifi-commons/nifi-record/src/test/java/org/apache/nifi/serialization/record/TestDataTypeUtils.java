@@ -27,6 +27,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -71,6 +73,80 @@ public class TestDataTypeUtils {
     private static final String CUSTOM_MONTH_DAY_YEAR_PATTERN = "MM-dd-yyyy";
 
     private static final String DATE_FIELD = "date";
+
+    @Test
+    void testChooseIntegerArrayOverStringWithNullElement() {
+        final Object[] value = {1, null};
+        final DataType arrayType = RecordFieldType.ARRAY.getArrayDataType(RecordFieldType.INT.getDataType());
+        final ChoiceDataType choice = (ChoiceDataType) RecordFieldType.CHOICE.getChoiceDataType(
+                List.of(RecordFieldType.STRING.getDataType(), arrayType));
+
+        assertEquals(arrayType, DataTypeUtils.chooseDataType(value, choice));
+    }
+
+    @Test
+    // REAL-WORLD scenario
+    void testChooseNestedRecordArrayOverStringArrayWithEmptyBranch() {
+        final RecordSchema entrySchema = new SimpleRecordSchema(List.of(
+                new RecordField("key", RecordFieldType.STRING.getDataType()),
+                new RecordField("value", RecordFieldType.STRING.getDataType())));
+        final Record entry = new MapRecord(entrySchema, Map.of("key", "example", "value", "sample"));
+        final Object[] value = {
+                new Object[] {new Object[0]},
+                new Object[] {new Object[] {entry}}
+        };
+        // 3-nested arrays.
+        final DataType recordArrayType = RecordFieldType.ARRAY.getArrayDataType(
+                RecordFieldType.ARRAY.getArrayDataType(
+                        RecordFieldType.ARRAY.getArrayDataType(RecordFieldType.RECORD.getRecordDataType(entrySchema))));
+        // 1-nested array.
+        final DataType stringArrayType = RecordFieldType.ARRAY.getArrayDataType(RecordFieldType.STRING.getDataType());
+        final ChoiceDataType choice = (ChoiceDataType) RecordFieldType.CHOICE.getChoiceDataType(List.of(stringArrayType, recordArrayType));
+
+        assertEquals(recordArrayType, DataTypeUtils.chooseDataType(value, choice));
+    }
+
+    @ParameterizedTest
+    @MethodSource("nestedArrayChoiceCases")
+    void testChooseNestedRecordArrayType(final int stringArrayDepth, final boolean stringFirst, final boolean includeEmptyBranch) {
+        final Logger logger = LoggerFactory.getLogger(TestDataTypeUtils.class);
+        final RecordSchema entrySchema = new SimpleRecordSchema(List.of(
+                new RecordField("key", RecordFieldType.STRING.getDataType()),
+                new RecordField("value", RecordFieldType.STRING.getDataType())));
+        final Record entry = new MapRecord(entrySchema, Map.of("key", "example", "value", "sample"));
+        final Object[] populatedBranch = new Object[] {new Object[] {entry}};
+        final Object[] value = includeEmptyBranch
+                ? new Object[] {new Object[] {new Object[0]}, populatedBranch}
+                : new Object[] {populatedBranch};
+        DataType recordArrayType = RecordFieldType.RECORD.getRecordDataType(entrySchema);
+        for (int depth = 0; depth < 3; depth++) {
+            recordArrayType = RecordFieldType.ARRAY.getArrayDataType(recordArrayType);
+        }
+
+        DataType stringArrayType = RecordFieldType.STRING.getDataType();
+        for (int depth = 0; depth < stringArrayDepth; depth++) {
+            stringArrayType = RecordFieldType.ARRAY.getArrayDataType(stringArrayType);
+        }
+
+        final List<DataType> alternatives = stringFirst ? List.of(stringArrayType, recordArrayType) : List.of(recordArrayType, stringArrayType);
+        final ChoiceDataType choice = (ChoiceDataType) RecordFieldType.CHOICE.getChoiceDataType(alternatives);
+        final DataType inferred = DataTypeUtils.inferDataType(value, null);
+        final boolean stringCompatible = DataTypeUtils.isCompatibleDataType(value, stringArrayType);
+        final boolean recordCompatible = DataTypeUtils.isCompatibleDataType(value, recordArrayType);
+        final List<DataType> compatible = alternatives.stream().filter(type -> DataTypeUtils.isCompatibleDataType(value, type)).toList();
+        final Optional<DataType> preferred = DataTypeUtils.findMostSuitableType(value, compatible, Function.identity());
+        final DataType chosen = DataTypeUtils.chooseDataType(value, choice);
+        logger.info("Choice={}, includeEmptyBranch={}, inferred={}, stringCompatible={}, recordCompatible={}, preferred={}, chosen={}",
+                choice, includeEmptyBranch, inferred, stringCompatible, recordCompatible, preferred, chosen);
+        logger.info("Wider match: string={}, record={}", DataTypeUtils.getWiderType(stringArrayType, inferred), DataTypeUtils.getWiderType(recordArrayType, inferred));
+        assertTrue(recordCompatible);
+        assertEquals(recordArrayType, chosen);
+    }
+
+    private static Stream<Arguments> nestedArrayChoiceCases() {
+        return Stream.of(1, 2, 3).flatMap(depth -> Stream.of(true, false)
+                .flatMap(stringFirst -> Stream.of(true, false).map(includeEmpty -> Arguments.of(depth, stringFirst, includeEmpty))));
+    }
 
     @Test
     public void testIntDoubleWiderType() {
