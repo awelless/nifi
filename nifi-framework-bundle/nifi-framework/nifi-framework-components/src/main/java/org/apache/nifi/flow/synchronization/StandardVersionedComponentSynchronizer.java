@@ -145,6 +145,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -160,6 +161,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -427,6 +430,7 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
 
             final VersionedExternalFlowMetadata metadata = versionedExternalFlow.getMetadata();
             final String flowIdentifier = metadata == null ? null : metadata.getFlowIdentifier();
+            StandardControllerServiceFactory.drainExperimentCreatedServices();
             for (final CreatedOrModifiedExtension createdOrModifiedExtension : createdAndModifiedExtensions) {
                 final ComponentNode extension = createdOrModifiedExtension.extension();
                 final Map<String, String> originalPropertyValues = createdOrModifiedExtension.propertyValues();
@@ -444,6 +448,7 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
                 }
             }
 
+            assignExperimentalVersionedIds(group, flowIdentifier);
             removeMissingControllerServices(group, versionedExternalFlow.getFlowContents());
         } finally {
             // Resume component scheduler, now that properties have been migrated, so that any components that are intended to be scheduled are.
@@ -451,6 +456,118 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
         }
 
         group.onComponentModified();
+    }
+
+    // EXPERIMENT ONLY. Assigns versioned IDs to the services created in this run, after all migrations, per the selected scheme.
+    private void assignExperimentalVersionedIds(final ProcessGroup synchronizedGroup, final @Nullable String synchronizedGroupIdentity) {
+        final String scheme = StandardControllerServiceFactory.experimentIdScheme();
+        final List<ControllerServiceNode> createdServices = StandardControllerServiceFactory.drainExperimentCreatedServices();
+        if ("O1".equals(scheme)) {
+            return;
+        }
+
+        final Map<ControllerServiceNode, String> baseDescriptions = new LinkedHashMap<>();
+        for (final ControllerServiceNode service : createdServices) {
+            final String identity = getOwningProcessGroupIdentity(service, synchronizedGroup, synchronizedGroupIdentity);
+            if (identity == null) {
+                continue;
+            }
+
+            final Map<String, String> properties = new TreeMap<>();
+            for (final Map.Entry<PropertyDescriptor, String> property : service.getRawPropertyValues().entrySet()) {
+                final PropertyDescriptor descriptor = service.getPropertyDescriptor(property.getKey().getName());
+                if (property.getValue() != null && !descriptor.isSensitive() && descriptor.getControllerServiceDefinition() == null) {
+                    properties.put(descriptor.getName(), property.getValue());
+                }
+            }
+            baseDescriptions.put(service, identity + service.getCanonicalClassName() + properties);
+        }
+
+        if ("O2".equals(scheme)) {
+            for (final Map.Entry<ControllerServiceNode, String> entry : baseDescriptions.entrySet()) {
+                final List<String> referencingIds = experimentReferencingKeys(entry.getKey(), false);
+                if (referencingIds == null) {
+                    LOG.info("EXPERIMENT O2: leaving {} unversioned, a referencing component has no versioned ID", entry.getKey());
+                    continue;
+                }
+
+                final String description = entry.getValue() + referencingIds;
+                String versionedId = experimentHash(description);
+                int counter = 0;
+                while (experimentIsUsed(entry.getKey(), versionedId)) {
+                    versionedId = experimentHash(description + ++counter);
+                }
+                entry.getKey().setVersionedComponentId(versionedId);
+                LOG.info("EXPERIMENT O2: assigned {} to {} from {}", versionedId, entry.getKey(), description);
+            }
+        } else if ("O5".equals(scheme)) {
+            // Ties are counted per process group: one run can synchronize several groups that hold the same flow, such as the whole canvas at startup
+            final Map<String, Integer> baseIdCounts = new HashMap<>();
+            baseDescriptions.forEach((service, description) -> baseIdCounts.merge(service.getProcessGroupIdentifier() + experimentHash(description), 1, Integer::sum));
+
+            for (final Map.Entry<ControllerServiceNode, String> entry : baseDescriptions.entrySet()) {
+                final ControllerServiceNode service = entry.getKey();
+                final String baseId = experimentHash(entry.getValue());
+                if (baseIdCounts.get(service.getProcessGroupIdentifier() + baseId) == 1 && !experimentIsUsed(service, baseId)) {
+                    service.setVersionedComponentId(baseId);
+                    LOG.info("EXPERIMENT O5: assigned base {} to {} from {}", baseId, service, entry.getValue());
+                    continue;
+                }
+
+                final List<String> slots = experimentReferencingKeys(service, true);
+                if (slots == null || slots.isEmpty()) {
+                    LOG.info("EXPERIMENT O5: leaving tied {} unversioned, it has no referencing slot", service);
+                    continue;
+                }
+
+                final String splitId = experimentHash(entry.getValue() + slots);
+                if (experimentIsUsed(service, splitId)) {
+                    LOG.info("EXPERIMENT O5: leaving tied {} unversioned, split ID {} is already used", service, splitId);
+                    continue;
+                }
+                service.setVersionedComponentId(splitId);
+                LOG.info("EXPERIMENT O5: assigned split {} to {} from {} {}", splitId, service, entry.getValue(), slots);
+            }
+        }
+    }
+
+    // Returns the sorted versioned IDs of the referencing components, or with slots the sorted "versionedId.propertyName" pairs; null if any lacks a versioned ID
+    private @Nullable List<String> experimentReferencingKeys(final ControllerServiceNode service, final boolean slots) {
+        final List<String> keys = new ArrayList<>();
+        for (final ComponentNode referencingComponent : service.getReferences().getReferencingComponents()) {
+            final Optional<String> versionedId = switch (referencingComponent) {
+                case final ProcessorNode processor -> processor.getVersionedComponentId();
+                case final ControllerServiceNode referencingService -> referencingService.getVersionedComponentId();
+                default -> Optional.empty();
+            };
+            if (versionedId.isEmpty()) {
+                return null;
+            }
+
+            if (!slots) {
+                keys.add(versionedId.get());
+                continue;
+            }
+
+            for (final Map.Entry<PropertyDescriptor, String> property : referencingComponent.getEffectivePropertyValues().entrySet()) {
+                if (property.getKey().getControllerServiceDefinition() != null && service.getIdentifier().equals(property.getValue())) {
+                    keys.add(versionedId.get() + "." + property.getKey().getName());
+                }
+            }
+        }
+
+        Collections.sort(keys);
+        return keys;
+    }
+
+    private boolean experimentIsUsed(final ControllerServiceNode service, final String versionedId) {
+        return service.getProcessGroup().getControllerServices(false).stream()
+            .filter(other -> other != service)
+            .anyMatch(other -> other.getVersionedComponentId().filter(versionedId::equals).isPresent());
+    }
+
+    private static String experimentHash(final String description) {
+        return UUID.nameUUIDFromBytes(description.getBytes(StandardCharsets.UTF_8)).toString();
     }
 
     private @Nullable String getOwningProcessGroupIdentity(final ComponentNode extension, final ProcessGroup synchronizedGroup, final @Nullable String synchronizedGroupIdentity) {

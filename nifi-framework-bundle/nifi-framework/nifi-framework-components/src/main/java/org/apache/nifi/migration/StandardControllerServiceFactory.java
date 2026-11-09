@@ -33,7 +33,11 @@ import org.apache.nifi.nar.NarClassLoadersHolder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -53,6 +57,27 @@ public class StandardControllerServiceFactory implements ControllerServiceFactor
      * added, and avoid reporting migration-created services as local modifications.
      */
     public static final String MIGRATION_CREATED_COMMENT = "Created during property migration";
+
+    // EXPERIMENT ONLY. Selects how migration-created services get their versioned ID:
+    // O1 = at creation (PR #11813), O2 = hash plus referencing versioned IDs, O5 = hash with ties split by referencing slot.
+    // O2 and O5 are assigned in the synchronizer after all migrations. Read on every call, so one build runs every scheme:
+    // echo O2 > "$TMPDIR/nifi-migration-id-scheme"
+    private static final Path EXPERIMENT_SCHEME_FILE = Path.of(System.getProperty("java.io.tmpdir"), "nifi-migration-id-scheme");
+    private static final ThreadLocal<List<ControllerServiceNode>> EXPERIMENT_CREATED_SERVICES = ThreadLocal.withInitial(ArrayList::new);
+
+    public static String experimentIdScheme() {
+        try {
+            return Files.readString(EXPERIMENT_SCHEME_FILE).trim();
+        } catch (final IOException e) {
+            return "O1";
+        }
+    }
+
+    public static List<ControllerServiceNode> drainExperimentCreatedServices() {
+        final List<ControllerServiceNode> createdServices = new ArrayList<>(EXPERIMENT_CREATED_SERVICES.get());
+        EXPERIMENT_CREATED_SERVICES.get().clear();
+        return createdServices;
+    }
 
 
     private final ExtensionManager extensionManager;
@@ -112,8 +137,9 @@ public class StandardControllerServiceFactory implements ControllerServiceFactor
         }
 
         serviceNode.setProperties(creationDetails.serviceProperties());
+        EXPERIMENT_CREATED_SERVICES.get().add(serviceNode);
 
-        final String versionedId = generateVersionedId(creationDetails, serviceNode);
+        final String versionedId = "O1".equals(experimentIdScheme()) ? generateVersionedId(creationDetails, serviceNode) : null;
         if (versionedId != null) {
             final Set<ControllerServiceNode> groupControllerServices = group.map(processGroup -> processGroup.getControllerServices(false)).orElse(Collections.emptySet());
             final boolean occupied = groupControllerServices.stream()
