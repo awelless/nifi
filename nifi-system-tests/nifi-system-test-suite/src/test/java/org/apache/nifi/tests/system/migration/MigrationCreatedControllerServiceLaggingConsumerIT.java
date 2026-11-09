@@ -77,14 +77,27 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
      */
     @Test
     void testSharedServiceSurvivesLaggingConsumerUpdates() throws NiFiClientException, IOException, InterruptedException {
-        final Scenario scenario = setUpBeforeUpgrade("Shared Service", null, null, null);
+        verifySharedServiceSurvives("Shared Service", false);
+    }
+
+    /**
+     * Case Z for X: the consumer first changes to V2, which was saved before the upgrade and so holds the legacy properties.
+     */
+    @Test
+    void testSharedServiceSurvivesLaggingConsumerUpdatesThroughLegacyVersion() throws NiFiClientException, IOException, InterruptedException {
+        verifySharedServiceSurvives("Shared Service Via Legacy V2", true);
+    }
+
+    private void verifySharedServiceSurvives(final String flowName, final boolean throughLegacyVersion)
+            throws NiFiClientException, IOException, InterruptedException {
+        final Scenario scenario = setUpBeforeUpgrade(flowName, null, null, null);
         upgradeRuntime();
 
         final Map<String, StoreSnapshot> authorStores = readStores(scenario.authorGroupId());
         saveFlowVersion(scenario.authorGroupId(), scenario.registryClient());
 
         final StoreSnapshot consumerStoreBefore = readStores(scenario.consumerGroupId()).get(PROCESSOR_A);
-        getClientUtil().changeFlowVersion(scenario.consumerGroupId(), VERSION_3, true);
+        changeToVersion3(scenario, throughLegacyVersion);
         final Map<String, StoreSnapshot> consumerStores = readStores(scenario.consumerGroupId());
 
         final List<Executable> checks = new ArrayList<>();
@@ -105,7 +118,7 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
     }
 
     /**
-     * Same as above, but the consumer first changes to V2, which was saved before the upgrade and so holds the legacy properties.
+     * Case Z for Y: the consumer first changes to V2, which was saved before the upgrade and so holds the legacy properties.
      */
     @Test
     void testServicesWithDifferentSecretsSurviveLaggingConsumerUpdatesThroughLegacyVersion() throws NiFiClientException, IOException, InterruptedException {
@@ -121,11 +134,7 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
         saveFlowVersion(scenario.authorGroupId(), scenario.registryClient());
 
         final StoreSnapshot consumerStoreBefore = readStores(scenario.consumerGroupId()).get(PROCESSOR_A);
-        if (throughLegacyVersion) {
-            getClientUtil().changeFlowVersion(scenario.consumerGroupId(), VERSION_2, true);
-            readStores(scenario.consumerGroupId());
-        }
-        getClientUtil().changeFlowVersion(scenario.consumerGroupId(), VERSION_3, true);
+        changeToVersion3(scenario, throughLegacyVersion);
         final Map<String, StoreSnapshot> consumerStores = readStores(scenario.consumerGroupId());
 
         final List<Executable> checks = new ArrayList<>();
@@ -136,6 +145,14 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
         checks.add(() -> assertEquals(authorStores.get(PROCESSOR_A).versionedId(), consumerStores.get(PROCESSOR_A).versionedId(), "consumer A's service versioned ID equals author A's"));
         checks.add(() -> assertEquals(authorStores.get(PROCESSOR_B).versionedId(), consumerStores.get(PROCESSOR_B).versionedId(), "consumer B's service versioned ID equals author B's"));
         assertAll(checks);
+    }
+
+    private void changeToVersion3(final Scenario scenario, final boolean throughLegacyVersion) throws NiFiClientException, IOException, InterruptedException {
+        if (throughLegacyVersion) {
+            getClientUtil().changeFlowVersion(scenario.consumerGroupId(), VERSION_2, true);
+            readStores(scenario.consumerGroupId());
+        }
+        getClientUtil().changeFlowVersion(scenario.consumerGroupId(), VERSION_3, true);
     }
 
     private void addPreservationChecks(final List<Executable> checks, final StoreSnapshot before, final StoreSnapshot after) {
