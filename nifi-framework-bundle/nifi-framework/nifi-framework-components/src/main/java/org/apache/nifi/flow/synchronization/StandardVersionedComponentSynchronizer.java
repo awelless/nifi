@@ -151,6 +151,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -431,7 +432,7 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
             final VersionedExternalFlowMetadata metadata = versionedExternalFlow.getMetadata();
             final String flowIdentifier = metadata == null ? null : metadata.getFlowIdentifier();
             StandardControllerServiceFactory.drainExperimentCreatedServices();
-            for (final CreatedOrModifiedExtension createdOrModifiedExtension : createdAndModifiedExtensions) {
+            for (final CreatedOrModifiedExtension createdOrModifiedExtension : experimentMigrationOrder(createdAndModifiedExtensions)) {
                 final ComponentNode extension = createdOrModifiedExtension.extension();
                 final Map<String, String> originalPropertyValues = createdOrModifiedExtension.propertyValues();
 
@@ -520,7 +521,51 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
                 service.setVersionedComponentId(versionedId);
                 LOG.info("EXPERIMENT O8: assigned {} to {} from {}", versionedId, service, entry.getValue());
             }
+        } else if ("I2".equals(scheme) || "I3".equals(scheme)) {
+            // Base hash for all services; a service with an inline secret also gets its creator's versioned ID (I2).
+            // A tie still taken is resolved by a counter, which is the whole rule for I3.
+            for (final Map.Entry<ControllerServiceNode, String> entry : baseDescriptions.entrySet()) {
+                final ControllerServiceNode service = entry.getKey();
+                String description = entry.getValue();
+                if ("I2".equals(scheme) && experimentHasInlineSecret(service)) {
+                    final String creatorId = StandardControllerServiceFactory.experimentCreatorId(service);
+                    if (creatorId == null) {
+                        LOG.info("EXPERIMENT I2: leaving {} unversioned, its creator has no versioned ID", service);
+                        continue;
+                    }
+                    description += "creator=" + creatorId;
+                }
+
+                String versionedId = experimentHash(description);
+                int counter = 0;
+                while (experimentIsUsed(service, versionedId)) {
+                    versionedId = experimentHash(description + ++counter);
+                }
+                service.setVersionedComponentId(versionedId);
+                LOG.info("EXPERIMENT {}: assigned {} to {} from {} counter {}", scheme, versionedId, service, description, counter);
+            }
         }
+    }
+
+    // EXPERIMENT ONLY. Migrates extensions sorted by name, descending if $TMPDIR/nifi-migration-order holds "desc", so a test
+    // can choose which processor creates a shared service. Without the file the original order is kept.
+    private static List<CreatedOrModifiedExtension> experimentMigrationOrder(final List<CreatedOrModifiedExtension> extensions) {
+        final java.nio.file.Path orderFile = java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "nifi-migration-order");
+        final String order;
+        try {
+            order = java.nio.file.Files.exists(orderFile) ? java.nio.file.Files.readString(orderFile).trim() : "";
+        } catch (final java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+
+        if (order.isEmpty()) {
+            return extensions;
+        }
+
+        final Comparator<CreatedOrModifiedExtension> byName = Comparator.comparing(extension -> String.valueOf(extension.extension().getName()));
+        final List<CreatedOrModifiedExtension> sorted = new ArrayList<>(extensions);
+        sorted.sort("desc".equals(order) ? byName.reversed() : byName);
+        return sorted;
     }
 
     // EXPERIMENT O8. Before services are added or removed, an unversioned local service with an inline secret takes the ID of an

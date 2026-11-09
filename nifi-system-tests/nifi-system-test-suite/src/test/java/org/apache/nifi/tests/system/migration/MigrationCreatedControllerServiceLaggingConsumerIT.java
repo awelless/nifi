@@ -77,7 +77,15 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
      */
     @Test
     void testSharedServiceSurvivesLaggingConsumerUpdates() throws NiFiClientException, IOException, InterruptedException {
-        verifySharedServiceSurvives("Shared Service", false);
+        verifySharedServiceSurvives("Shared Service", false, null);
+    }
+
+    /**
+     * Same as above, but A and B carry the same inline secret, so the shared service has an inline secret too.
+     */
+    @Test
+    void testSharedServiceWithInlineSecretSurvivesLaggingConsumerUpdates() throws NiFiClientException, IOException, InterruptedException {
+        verifySharedServiceSurvives("Shared Service With Inline Secret", false, "shared-secret");
     }
 
     /**
@@ -85,12 +93,12 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
      */
     @Test
     void testSharedServiceSurvivesLaggingConsumerUpdatesThroughLegacyVersion() throws NiFiClientException, IOException, InterruptedException {
-        verifySharedServiceSurvives("Shared Service Via Legacy V2", true);
+        verifySharedServiceSurvives("Shared Service Via Legacy V2", true, null);
     }
 
-    private void verifySharedServiceSurvives(final String flowName, final boolean throughLegacyVersion)
+    private void verifySharedServiceSurvives(final String flowName, final boolean throughLegacyVersion, final String password)
             throws NiFiClientException, IOException, InterruptedException {
-        final Scenario scenario = setUpBeforeUpgrade(flowName, null, null, null);
+        final Scenario scenario = setUpBeforeUpgrade(flowName, password, password, password);
         upgradeRuntime();
 
         saveFlowVersion(scenario.authorGroupId(), scenario.registryClient());
@@ -105,6 +113,9 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
         addPreservationChecks(checks, consumerStoreBefore, consumerStores.get(PROCESSOR_A));
         checks.add(() -> assertEquals(consumerStores.get(PROCESSOR_A).serviceId(), consumerStores.get(PROCESSOR_B).serviceId(), "consumer processors share one service"));
         checks.add(() -> assertEquals(authorStores.get(PROCESSOR_A).versionedId(), consumerStores.get(PROCESSOR_A).versionedId(), "consumer service versioned ID equals author's"));
+        if (password != null) {
+            checks.add(() -> assertEquals(password, consumerStores.get(PROCESSOR_A).password(), "consumer's service still has its secret"));
+        }
         assertAll(checks);
     }
 
