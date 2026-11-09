@@ -44,9 +44,16 @@ public class MigrateToControllerService extends AbstractProcessor {
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
+    static final PropertyDescriptor STORE_PASSWORD = new PropertyDescriptor.Builder()
+            .name("Store Password")
+            .required(false)
+            .sensitive(true)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+
     static final Relationship REL_SUCCESS = new Relationship.Builder().name("success").build();
 
-    private static final List<PropertyDescriptor> PROPERTIES = List.of(STORE_NAME);
+    private static final List<PropertyDescriptor> PROPERTIES = List.of(STORE_NAME, STORE_PASSWORD);
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS);
 
     @Override

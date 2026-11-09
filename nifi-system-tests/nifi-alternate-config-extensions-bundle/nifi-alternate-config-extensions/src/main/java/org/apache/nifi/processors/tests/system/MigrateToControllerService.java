@@ -30,6 +30,7 @@ import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -67,13 +68,23 @@ public class MigrateToControllerService extends AbstractProcessor {
 
     @Override
     public void migrateProperties(final PropertyConfiguration config) {
-        final String storeName = config.getPropertyValue("Store Name").orElse(null);
-        config.removeProperty("Store Name");
+        if (!config.isPropertySet(STORE_SERVICE)) {
+            final String storeName = config.getPropertyValue("Store Name").orElse(null);
+            final String storePassword = config.getRawPropertyValue("Store Password").orElse(null);
 
-        if (storeName != null) {
-            final String serviceId = config.createControllerService(StateBackedStoreService.class.getName(), Map.of("Store Name", storeName));
+            // Pass the secret under its obsolete name, as the AWS and proxy migrations do, so that only the service's own migration recognizes it as sensitive
+            final Map<String, String> serviceProperties = new HashMap<>();
+            serviceProperties.put("Store Name", storeName);
+            if (storePassword != null) {
+                serviceProperties.put("store-password", storePassword);
+            }
+
+            final String serviceId = config.createControllerService(StateBackedStoreService.class.getName(), serviceProperties);
             config.setProperty(STORE_SERVICE, serviceId);
         }
+
+        config.removeProperty("Store Name");
+        config.removeProperty("Store Password");
     }
 
     @Override

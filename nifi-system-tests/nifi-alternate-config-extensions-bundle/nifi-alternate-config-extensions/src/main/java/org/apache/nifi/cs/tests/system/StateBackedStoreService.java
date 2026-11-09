@@ -25,6 +25,7 @@ import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.components.state.StateMap;
 import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.controller.ConfigurationContext;
+import org.apache.nifi.migration.PropertyConfiguration;
 import org.apache.nifi.processor.util.StandardValidators;
 
 import java.io.IOException;
@@ -51,15 +52,29 @@ public class StateBackedStoreService extends AbstractControllerService implement
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
+    static final PropertyDescriptor STORE_PASSWORD = new PropertyDescriptor.Builder()
+            .name("Store Password")
+            .required(false)
+            .sensitive(true)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+
     static final String CREATED_KEY = "created";
     static final String ROW_COUNT_KEY = "rowCount";
     static final String LAST_ROW_KEY = "lastRow";
+    // Test-only: exposes which secret the service was enabled with, so that tests can detect services swapped between processors
+    static final String PASSWORD_KEY = "password";
 
-    private static final List<PropertyDescriptor> PROPERTIES = List.of(STORE_NAME);
+    private static final List<PropertyDescriptor> PROPERTIES = List.of(STORE_NAME, STORE_PASSWORD);
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         return PROPERTIES;
+    }
+
+    @Override
+    public void migrateProperties(final PropertyConfiguration config) {
+        config.renameProperty("store-password", STORE_PASSWORD.getName());
     }
 
     /**
@@ -70,13 +85,14 @@ public class StateBackedStoreService extends AbstractControllerService implement
     public void onEnabled(final ConfigurationContext context) throws IOException {
         final StateManager stateManager = getStateManager();
         final StateMap stateMap = stateManager.getState(Scope.LOCAL);
-        if (stateMap.get(CREATED_KEY) != null) {
-            return;
+        final Map<String, String> state = new HashMap<>(stateMap.toMap());
+        if (stateMap.get(CREATED_KEY) == null) {
+            state.put(CREATED_KEY, String.valueOf(System.currentTimeMillis()));
+            state.put(ROW_COUNT_KEY, "0");
         }
 
-        final Map<String, String> state = new HashMap<>();
-        state.put(CREATED_KEY, String.valueOf(System.currentTimeMillis()));
-        state.put(ROW_COUNT_KEY, "0");
+        final String password = context.getProperty(STORE_PASSWORD).getValue();
+        state.put(PASSWORD_KEY, password == null ? "" : password);
         stateManager.setState(state, Scope.LOCAL);
     }
 
