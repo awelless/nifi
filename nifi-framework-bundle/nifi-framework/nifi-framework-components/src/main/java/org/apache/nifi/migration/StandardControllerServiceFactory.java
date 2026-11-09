@@ -59,7 +59,7 @@ public class StandardControllerServiceFactory implements ControllerServiceFactor
     public static final String MIGRATION_CREATED_COMMENT = "Created during property migration";
 
     // EXPERIMENT ONLY. Selects how migration-created services get their versioned ID:
-    // O1 = at creation (PR #11813), O2 = hash plus referencing versioned IDs, O5 = hash with ties split by referencing slot.
+    // O1 = at creation (PR #11813), O2 = hash plus referencing versioned IDs, O5 = hash, ties split by referencing versioned IDs.
     // O2 and O5 are assigned in the synchronizer after all migrations. Read on every call, so one build runs every scheme:
     // echo O2 > "$TMPDIR/nifi-migration-id-scheme"
     private static final Path EXPERIMENT_SCHEME_FILE = Path.of(System.getProperty("java.io.tmpdir"), "nifi-migration-id-scheme");

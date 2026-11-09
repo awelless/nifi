@@ -485,20 +485,7 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
 
         if ("O2".equals(scheme)) {
             for (final Map.Entry<ControllerServiceNode, String> entry : baseDescriptions.entrySet()) {
-                final List<String> referencingIds = experimentReferencingKeys(entry.getKey(), false);
-                if (referencingIds == null) {
-                    LOG.info("EXPERIMENT O2: leaving {} unversioned, a referencing component has no versioned ID", entry.getKey());
-                    continue;
-                }
-
-                final String description = entry.getValue() + referencingIds;
-                String versionedId = experimentHash(description);
-                int counter = 0;
-                while (experimentIsUsed(entry.getKey(), versionedId)) {
-                    versionedId = experimentHash(description + ++counter);
-                }
-                entry.getKey().setVersionedComponentId(versionedId);
-                LOG.info("EXPERIMENT O2: assigned {} to {} from {}", versionedId, entry.getKey(), description);
+                experimentAssignWithReferencingIds(entry.getKey(), entry.getValue());
             }
         } else if ("O5".equals(scheme)) {
             // Ties are counted per process group: one run can synchronize several groups that hold the same flow, such as the whole canvas at startup
@@ -514,25 +501,31 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
                     continue;
                 }
 
-                final List<String> slots = experimentReferencingKeys(service, true);
-                if (slots == null || slots.isEmpty()) {
-                    LOG.info("EXPERIMENT O5: leaving tied {} unversioned, it has no referencing slot", service);
-                    continue;
-                }
-
-                final String splitId = experimentHash(entry.getValue() + slots);
-                if (experimentIsUsed(service, splitId)) {
-                    LOG.info("EXPERIMENT O5: leaving tied {} unversioned, split ID {} is already used", service, splitId);
-                    continue;
-                }
-                service.setVersionedComponentId(splitId);
-                LOG.info("EXPERIMENT O5: assigned split {} to {} from {} {}", splitId, service, entry.getValue(), slots);
+                experimentAssignWithReferencingIds(service, entry.getValue());
             }
         }
     }
 
-    // Returns the sorted versioned IDs of the referencing components, or with slots the sorted "versionedId.propertyName" pairs; null if any lacks a versioned ID
-    private @Nullable List<String> experimentReferencingKeys(final ControllerServiceNode service, final boolean slots) {
+    // Assigns hash(base description, referencing versioned IDs), adding a counter while the ID is used by another service in the group
+    private void experimentAssignWithReferencingIds(final ControllerServiceNode service, final String baseDescription) {
+        final List<String> referencingIds = experimentReferencingIds(service);
+        if (referencingIds == null) {
+            LOG.info("EXPERIMENT: leaving {} unversioned, a referencing component has no versioned ID", service);
+            return;
+        }
+
+        final String description = baseDescription + referencingIds;
+        String versionedId = experimentHash(description);
+        int counter = 0;
+        while (experimentIsUsed(service, versionedId)) {
+            versionedId = experimentHash(description + ++counter);
+        }
+        service.setVersionedComponentId(versionedId);
+        LOG.info("EXPERIMENT: assigned {} to {} from {}", versionedId, service, description);
+    }
+
+    // Returns the sorted versioned IDs of the referencing components, or null if any lacks a versioned ID
+    private @Nullable List<String> experimentReferencingIds(final ControllerServiceNode service) {
         final List<String> keys = new ArrayList<>();
         for (final ComponentNode referencingComponent : service.getReferences().getReferencingComponents()) {
             final Optional<String> versionedId = switch (referencingComponent) {
@@ -544,16 +537,7 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
                 return null;
             }
 
-            if (!slots) {
-                keys.add(versionedId.get());
-                continue;
-            }
-
-            for (final Map.Entry<PropertyDescriptor, String> property : referencingComponent.getEffectivePropertyValues().entrySet()) {
-                if (property.getKey().getControllerServiceDefinition() != null && service.getIdentifier().equals(property.getValue())) {
-                    keys.add(versionedId.get() + "." + property.getKey().getName());
-                }
-            }
+            keys.add(versionedId.get());
         }
 
         Collections.sort(keys);
