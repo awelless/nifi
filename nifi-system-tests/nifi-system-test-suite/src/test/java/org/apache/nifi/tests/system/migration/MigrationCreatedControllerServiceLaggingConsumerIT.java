@@ -93,8 +93,8 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
         final Scenario scenario = setUpBeforeUpgrade(flowName, null, null, null);
         upgradeRuntime();
 
-        final Map<String, StoreSnapshot> authorStores = readStores(scenario.authorGroupId());
         saveFlowVersion(scenario.authorGroupId(), scenario.registryClient());
+        final Map<String, StoreSnapshot> authorStores = readStores(scenario.authorGroupId());
 
         final StoreSnapshot consumerStoreBefore = readStores(scenario.consumerGroupId()).get(PROCESSOR_A);
         changeToVersion3(scenario, throughLegacyVersion);
@@ -130,8 +130,8 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
         final Scenario scenario = setUpBeforeUpgrade(flowName, "author-secret-a", "author-secret-b", "consumer-secret-a");
         upgradeRuntime();
 
-        final Map<String, StoreSnapshot> authorStores = readStores(scenario.authorGroupId());
         saveFlowVersion(scenario.authorGroupId(), scenario.registryClient());
+        final Map<String, StoreSnapshot> authorStores = readStores(scenario.authorGroupId());
 
         final StoreSnapshot consumerStoreBefore = readStores(scenario.consumerGroupId()).get(PROCESSOR_A);
         changeToVersion3(scenario, throughLegacyVersion);

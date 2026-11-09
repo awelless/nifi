@@ -476,7 +476,7 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
             final Map<String, String> properties = new TreeMap<>();
             for (final Map.Entry<PropertyDescriptor, String> property : service.getRawPropertyValues().entrySet()) {
                 final PropertyDescriptor descriptor = service.getPropertyDescriptor(property.getKey().getName());
-                if (property.getValue() != null && !descriptor.isSensitive() && descriptor.getControllerServiceDefinition() == null) {
+                if (property.getValue() != null && (!descriptor.isSensitive() || !service.getProperty(descriptor).getParameterReferences().isEmpty()) && descriptor.getControllerServiceDefinition() == null) {
                     properties.put(descriptor.getName(), property.getValue());
                 }
             }
@@ -503,7 +503,110 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
 
                 experimentAssignWithReferencingIds(service, entry.getValue());
             }
+        } else if ("O8".equals(scheme)) {
+            // A service with an inline secret stays unversioned; it adopts the incoming ID on the next version change
+            for (final Map.Entry<ControllerServiceNode, String> entry : baseDescriptions.entrySet()) {
+                final ControllerServiceNode service = entry.getKey();
+                if (experimentHasInlineSecret(service)) {
+                    LOG.info("EXPERIMENT O8: leaving {} unversioned, it has an inline secret", service);
+                    continue;
+                }
+
+                String versionedId = experimentHash(entry.getValue());
+                int counter = 0;
+                while (experimentIsUsed(service, versionedId)) {
+                    versionedId = experimentHash(entry.getValue() + ++counter);
+                }
+                service.setVersionedComponentId(versionedId);
+                LOG.info("EXPERIMENT O8: assigned {} to {} from {}", versionedId, service, entry.getValue());
+            }
         }
+    }
+
+    // EXPERIMENT O8. Before services are added or removed, an unversioned local service with an inline secret takes the ID of an
+    // unmatched incoming service: the only one with the same type and non-sensitive properties, else the one that the referencing
+    // processors' properties point to in the incoming flow. If still ambiguous, it gets no ID and is replaced as before.
+    private void experimentAdoptInlineSecretServices(final ProcessGroup group, final VersionedProcessGroup proposed,
+                                                     final Map<String, ControllerServiceNode> servicesByVersionedId) {
+        final List<VersionedControllerService> unmatched = new ArrayList<>(proposed.getControllerServices().stream()
+            .filter(proposedService -> !servicesByVersionedId.containsKey(proposedService.getIdentifier()))
+            .toList());
+
+        for (final ControllerServiceNode service : group.getControllerServices(false)) {
+            if (service.getVersionedComponentId().isPresent() || !experimentHasInlineSecret(service)) {
+                continue;
+            }
+
+            final List<VersionedControllerService> sameType = unmatched.stream()
+                .filter(candidate -> candidate.getType().equals(service.getCanonicalClassName()))
+                .toList();
+            final Map<String, String> localProperties = experimentNonSensitiveProperties(service, service.getRawPropertyValues().entrySet().stream()
+                .collect(HashMap::new, (map, property) -> map.put(property.getKey().getName(), property.getValue()), HashMap::putAll));
+            List<VersionedControllerService> candidates = sameType.stream()
+                .filter(candidate -> localProperties.equals(experimentNonSensitiveProperties(service, candidate.getProperties())))
+                .toList();
+            if (candidates.size() != 1) {
+                final Set<String> referencedIds = experimentIncomingReferences(service, proposed);
+                candidates = referencedIds.size() == 1
+                    ? sameType.stream().filter(candidate -> referencedIds.contains(candidate.getIdentifier())).toList()
+                    : List.of();
+            }
+
+            if (candidates.size() != 1) {
+                LOG.info("EXPERIMENT O8: no unique incoming service for {}, it will be replaced", service);
+                continue;
+            }
+
+            final VersionedControllerService adopted = candidates.getFirst();
+            servicesByVersionedId.values().remove(service);
+            service.setVersionedComponentId(adopted.getIdentifier());
+            servicesByVersionedId.put(adopted.getIdentifier(), service);
+            unmatched.remove(adopted);
+            LOG.info("EXPERIMENT O8: {} adopted incoming ID {}", service, adopted.getIdentifier());
+        }
+    }
+
+    // Returns the incoming service IDs that the incoming versions of the local referencing processors point to, through the same properties
+    private Set<String> experimentIncomingReferences(final ControllerServiceNode service, final VersionedProcessGroup proposed) {
+        final Set<String> referencedIds = new HashSet<>();
+        for (final ComponentNode referencingComponent : service.getReferences().getReferencingComponents()) {
+            if (!(referencingComponent instanceof final ProcessorNode processor) || processor.getVersionedComponentId().isEmpty()) {
+                continue;
+            }
+
+            final String processorVersionedId = processor.getVersionedComponentId().get();
+            proposed.getProcessors().stream()
+                .filter(proposedProcessor -> proposedProcessor.getIdentifier().equals(processorVersionedId))
+                .findFirst()
+                .ifPresent(proposedProcessor -> processor.getRawPropertyValues().forEach((descriptor, value) -> {
+                    final String proposedValue = proposedProcessor.getProperties().get(descriptor.getName());
+                    if (service.getIdentifier().equals(value) && proposedValue != null) {
+                        referencedIds.add(proposedValue);
+                    }
+                }));
+        }
+
+        return referencedIds;
+    }
+
+    // Non-null properties that are neither sensitive nor controller service references, judged by the local service's descriptors
+    private Map<String, String> experimentNonSensitiveProperties(final ControllerServiceNode service, final Map<String, String> properties) {
+        final Map<String, String> result = new TreeMap<>();
+        properties.forEach((name, value) -> {
+            final PropertyDescriptor descriptor = service.getPropertyDescriptor(name);
+            if (value != null && !descriptor.isSensitive() && descriptor.getControllerServiceDefinition() == null) {
+                result.put(name, value);
+            }
+        });
+        return result;
+    }
+
+    // A sensitive value that is not exactly one parameter reference is inline: it is never committed to the registry
+    private boolean experimentHasInlineSecret(final ControllerServiceNode service) {
+        return service.getRawPropertyValues().entrySet().stream()
+            .anyMatch(property -> property.getValue() != null
+                && service.getPropertyDescriptor(property.getKey().getName()).isSensitive()
+                && !property.getValue().matches("#\\{[^}]+}"));
     }
 
     // Assigns hash(base description, referencing versioned IDs), adding a counter while the ID is used by another service in the group
@@ -714,6 +817,9 @@ public class StandardVersionedComponentSynchronizer implements VersionedComponen
         // Controller Services
         final Map<String, ControllerServiceNode> controllerServicesByVersionedId = componentsById(group, grp -> grp.getControllerServices(false),
             ControllerServiceNode::getIdentifier, ControllerServiceNode::getVersionedComponentId);
+        if ("O8".equals(StandardControllerServiceFactory.experimentIdScheme())) {
+            experimentAdoptInlineSecretServices(group, proposed, controllerServicesByVersionedId);
+        }
         synchronizeControllerServices(group, proposed, controllerServicesByVersionedId, topLevelGroup);
 
         // Remove any connections that are not in the Proposed Process Group
