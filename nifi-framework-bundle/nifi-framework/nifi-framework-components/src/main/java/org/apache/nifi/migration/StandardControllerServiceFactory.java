@@ -20,9 +20,11 @@ package org.apache.nifi.migration;
 import jakarta.annotation.Nullable;
 import org.apache.nifi.bundle.Bundle;
 import org.apache.nifi.bundle.BundleCoordinate;
+import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.validation.ValidationStatus;
 import org.apache.nifi.controller.ComponentNode;
 import org.apache.nifi.controller.ControllerService;
+import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.controller.service.ControllerServiceNode;
 import org.apache.nifi.controller.service.ControllerServiceProvider;
@@ -59,11 +61,19 @@ public class StandardControllerServiceFactory implements ControllerServiceFactor
     public static final String MIGRATION_CREATED_COMMENT = "Created during property migration";
 
     // EXPERIMENT ONLY. Selects how migration-created services get their versioned ID:
-    // O1 = at creation (PR #11813), O2 = hash plus referencing versioned IDs, O5 = hash, ties split by referencing versioned IDs.
-    // O2 and O5 are assigned in the synchronizer after all migrations. Read on every call, so one build runs every scheme:
+    // O1 = at creation (PR #11813), O2 = hash plus referencing versioned IDs, O5 = hash, ties split by referencing versioned IDs,
+    // O8 = hash, but services with an inline secret stay unversioned and adopt the incoming ID on a version change,
+    // I2 = hash, plus the creator's versioned ID for services with an inline secret, I3 = hash, plus a counter for ties.
+    // O2, O5, O8, I2 and I3 are assigned in the synchronizer after all migrations. Read on every call, so one build runs every scheme:
     // echo O2 > "$TMPDIR/nifi-migration-id-scheme"
     private static final Path EXPERIMENT_SCHEME_FILE = Path.of(System.getProperty("java.io.tmpdir"), "nifi-migration-id-scheme");
     private static final ThreadLocal<List<ControllerServiceNode>> EXPERIMENT_CREATED_SERVICES = ThreadLocal.withInitial(ArrayList::new);
+    // Versioned ID of the component whose migration created each service, for scheme I2
+    private static final Map<ControllerServiceNode, String> EXPERIMENT_CREATOR_IDS = Collections.synchronizedMap(new HashMap<>());
+
+    public static @Nullable String experimentCreatorId(final ControllerServiceNode service) {
+        return EXPERIMENT_CREATOR_IDS.get(service);
+    }
 
     public static String experimentIdScheme() {
         try {
@@ -138,6 +148,13 @@ public class StandardControllerServiceFactory implements ControllerServiceFactor
 
         serviceNode.setProperties(creationDetails.serviceProperties());
         EXPERIMENT_CREATED_SERVICES.get().add(serviceNode);
+        final Optional<String> creatorVersionedId = switch (creator) {
+            case final ProcessorNode processor -> processor.getVersionedComponentId();
+            case final ControllerServiceNode service -> service.getVersionedComponentId();
+            default -> Optional.empty();
+        };
+        creatorVersionedId.ifPresent(creatorId -> EXPERIMENT_CREATOR_IDS.put(serviceNode, creatorId));
+        logger.info("EXPERIMENT: {} created by {} ({})", serviceNode, creator, creatorVersionedId.orElse(null));
 
         final String versionedId = "O1".equals(experimentIdScheme()) ? generateVersionedId(creationDetails, serviceNode) : null;
         if (versionedId != null) {
@@ -178,9 +195,12 @@ public class StandardControllerServiceFactory implements ControllerServiceFactor
 
         final Map<String, String> sortedProperties = new TreeMap<>();
         for (final Map.Entry<String, String> property : creationDetails.serviceProperties().entrySet()) {
-            if (!serviceNode.getPropertyDescriptor(property.getKey()).isSensitive()) {
+            final PropertyDescriptor descriptor = serviceNode.getPropertyDescriptor(property.getKey());
+
+            if (!descriptor.isSensitive() || !serviceNode.getProperty(descriptor).getParameterReferences().isEmpty()) {
                 sortedProperties.put(property.getKey(), property.getValue());
             }
+            // check CS reference
         }
 
         final String componentDescription = owningGroupIdentity + creationDetails.type() + sortedProperties;
