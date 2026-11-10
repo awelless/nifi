@@ -158,6 +158,42 @@ class MigrationCreatedControllerServiceLaggingConsumerIT extends AbstractNarSwap
         assertAll(checks);
     }
 
+    /**
+     * UC4: the author's A and B carry the same inline secret, so they share one service, while the consumer's secrets differ, so it
+     * has two services where the flow has one. Each consumer processor should keep its own service and secret.
+     */
+    @Test
+    void testDifferentLocalSecretsSurviveServiceSharedOnlyByAuthor() throws NiFiClientException, IOException, InterruptedException {
+        final String flowName = "Shared By Author Only";
+        Files.createDirectories(registryDirectory.resolve(TEST_FLOWS_BUCKET));
+        final FlowRegistryClientEntity registryClient = registerClient(registryDirectory.toFile());
+
+        final ProcessGroupEntity authorGroup = getClientUtil().createProcessGroup(flowName, ROOT_PG);
+        createMigratingProcessor(authorGroup.getId(), PROCESSOR_A, "author-secret");
+        createMigratingProcessor(authorGroup.getId(), PROCESSOR_B, "author-secret");
+        final VersionControlInformationEntity vci = getClientUtil().startVersionControl(authorGroup, registryClient, TEST_FLOWS_BUCKET, flowName);
+        final String flowId = vci.getVersionControlInformation().getFlowId();
+
+        final ProcessGroupEntity consumerGroup = getClientUtil().importFlowFromRegistry(ROOT_PG, registryClient.getId(), TEST_FLOWS_BUCKET, flowId, VERSION_1);
+        getClientUtil().updateProcessorProperties(findProcessor(consumerGroup.getId(), PROCESSOR_A), Map.of(STORE_PASSWORD_PROPERTY, "consumer-secret-a"));
+        getClientUtil().updateProcessorProperties(findProcessor(consumerGroup.getId(), PROCESSOR_B), Map.of(STORE_PASSWORD_PROPERTY, "consumer-secret-b"));
+        upgradeRuntime();
+
+        saveFlowVersion(authorGroup.getId(), registryClient);
+        final Map<String, StoreSnapshot> authorStores = readStores(authorGroup.getId());
+        final Map<String, StoreSnapshot> consumerStoresBefore = readStores(consumerGroup.getId());
+        getClientUtil().changeFlowVersion(consumerGroup.getId(), VERSION_2, true);
+        final Map<String, StoreSnapshot> consumerStores = readStores(consumerGroup.getId());
+
+        final List<Executable> checks = new ArrayList<>();
+        checks.add(() -> assertEquals(authorStores.get(PROCESSOR_A).serviceId(), authorStores.get(PROCESSOR_B).serviceId(), "author processors share one service"));
+        addPreservationChecks(checks, consumerStoresBefore.get(PROCESSOR_A), consumerStores.get(PROCESSOR_A));
+        checks.add(() -> assertEquals("consumer-secret-a", consumerStores.get(PROCESSOR_A).password(), "consumer A's service still has consumer A's secret"));
+        checks.add(() -> assertEquals(consumerStoresBefore.get(PROCESSOR_B).serviceId(), consumerStores.get(PROCESSOR_B).serviceId(), "consumer B keeps the same service instance"));
+        checks.add(() -> assertEquals("consumer-secret-b", consumerStores.get(PROCESSOR_B).password(), "consumer B's service still has consumer B's secret"));
+        assertAll(checks);
+    }
+
     private void changeToVersion3(final Scenario scenario, final boolean throughLegacyVersion) throws NiFiClientException, IOException, InterruptedException {
         if (throughLegacyVersion) {
             getClientUtil().changeFlowVersion(scenario.consumerGroupId(), VERSION_2, true);
